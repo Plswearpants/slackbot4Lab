@@ -1,0 +1,49 @@
+[project]
+name = "slackqa"
+version = "0.1.0"
+description = "Slack bot that answers questions from channel history, with citations"
+readme = "README.md"
+authors = [
+    { name = "Plswearpants", email = "dongchen088@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "slack-bolt>=1.21.0",
+    "aiohttp>=3.9.0",
+    "openai>=1.40.0",
+    "httpx>=0.27.0",
+    "fastembed>=0.4.0",
+    "aiosqlite>=0.20.0",
+    "numpy>=1.26.0",
+    "pydantic-settings>=2.3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+slackqa = "slackqa.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.12,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Import from src directly rather than via the installed .pth. On this machine
+# something re-applies macOS's UF_HIDDEN flag to files under .venv, and
+# CPython's site.addpackage silently skips hidden .pth files — so the editable
+# install stops resolving with no error. See README "Known environment issue".
+pythonpath = ["src"]

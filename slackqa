@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Wrapper that pins the virtualenv outside ~/Documents.
+#
+# Something under ~/Documents re-applies macOS's UF_HIDDEN flag to files uv
+# writes into .venv, and CPython's site.addpackage silently skips hidden .pth
+# files — so an in-project .venv loses `import slackqa` on every `uv sync`,
+# with no error. A venv elsewhere is unaffected.
+#
+# Usage: ./slackqa ask C0123ABC "what did we decide?"
+set -euo pipefail
+cd "$(dirname "$0")"
+export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$HOME/.venvs/slackqa}"
+exec uv run slackqa "$@"
