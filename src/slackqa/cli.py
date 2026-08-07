@@ -8,6 +8,7 @@ import logging
 import sys
 from datetime import date
 
+from slackqa.answerer import CredentialsError
 from slackqa.config import get_settings
 
 
@@ -22,20 +23,13 @@ def _setup_logging(verbose: bool) -> None:
 
 
 async def _run() -> int:
-    from slackqa.answerer import CredentialsError
     from slackqa.app import build
 
     settings = get_settings()
     if not settings.channels:
         print("No channels configured. Set CHANNELS=C0123ABC,C0456DEF in .env")
         return 1
-    try:
-        bot = await build(settings)
-    except CredentialsError as e:
-        # A dead key is a config problem, not a crash: say so in one line
-        # rather than burying it in a traceback.
-        print(f"\nStartup aborted: {e}\n")
-        return 2
+    bot = await build(settings)
     await bot.sync_all()
     await bot.start()
     return 0
@@ -178,6 +172,18 @@ def main() -> None:
     _setup_logging(args.verbose)
 
     command = args.command or "run"
+    try:
+        code = _dispatch(command, args, parser)
+    except CredentialsError as e:
+        # A dead key is a config problem, not a crash. Every command builds the
+        # app and so can hit this; handling it once here means none of them can
+        # dump a traceback at the user.
+        print(f"\n{e}\n")
+        code = 2
+    sys.exit(code)
+
+
+def _dispatch(command: str, args, parser) -> int:
     if command == "run":
         code = asyncio.run(_run())
     elif command == "sync":
@@ -195,8 +201,7 @@ def main() -> None:
     else:
         parser.print_help()
         code = 1
-
-    sys.exit(code)
+    return code
 
 
 if __name__ == "__main__":

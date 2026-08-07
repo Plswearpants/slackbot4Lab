@@ -63,3 +63,36 @@ def test_missing_required_key_raises():
         os.environ.pop(k, None)
     with pytest.raises(ValidationError):
         Settings()  # type: ignore[call-arg]
+
+
+async def test_build_closes_the_store_when_startup_fails(tmp_path, monkeypatch):
+    """A failed startup must not leave the sqlite thread running.
+
+    aiosqlite gives each connection a non-daemon thread; leaking one makes the
+    CLI print its error and then hang instead of exiting.
+    """
+    import slackqa.app as app_mod
+    from slackqa.answerer import CredentialsError
+
+    closed: list[bool] = []
+
+    class FakeStore:
+        async def close(self):
+            closed.append(True)
+
+    async def fake_open(_path):
+        return FakeStore()
+
+    class FakeBot:
+        def __init__(self, settings, store):
+            pass
+
+        async def identify(self):
+            raise CredentialsError("key rejected")
+
+    monkeypatch.setattr(app_mod.Store, "open", staticmethod(fake_open))
+    monkeypatch.setattr(app_mod, "SlackQA", FakeBot)
+
+    with pytest.raises(CredentialsError):
+        await app_mod.build(build())
+    assert closed == [True]

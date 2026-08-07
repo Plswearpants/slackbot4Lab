@@ -354,5 +354,12 @@ class SlackQA:
 async def build(settings: Settings) -> SlackQA:
     store = await Store.open(settings.db_path)
     bot = SlackQA(settings, store)
-    await bot.identify()
+    try:
+        await bot.identify()
+    except BaseException:
+        # aiosqlite runs each connection on its own non-daemon thread, so a
+        # store left open after a failed startup keeps the process alive
+        # forever — the error prints and the command never returns.
+        await store.close()
+        raise
     return bot
