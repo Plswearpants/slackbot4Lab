@@ -18,7 +18,7 @@ import time
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
-from slackqa import ingest
+from slackqa import dashboard, ingest
 from slackqa.answerer import Answerer, CredentialsError, OpenRouterCompleter, Turn
 from slackqa.config import Settings
 from slackqa.embeddings import FastEmbedEmbedder
@@ -27,6 +27,7 @@ from slackqa.glossary import Glossary, SkipList, render_html
 from slackqa.mining import mine, refresh_volatile
 from slackqa.names import NameResolver
 from slackqa.retrieval import Retriever
+from slackqa.skills import Skill
 from slackqa.store import Store
 
 logger = logging.getLogger(__name__)
@@ -53,10 +54,14 @@ class SlackQA:
             min_cosine=settings.relevance_threshold,
         )
         self.glossary = Glossary.load(settings.glossary_path)
+        self.skill = Skill(settings.skill_path) if settings.skill_enabled else None
         self.skip = SkipList.load(settings.glossary_skip_path)
         self.completer: OpenRouterCompleter | None = None
         self._mining_task: asyncio.Task | None = None
         self._channel_names: dict[str, str] | None = None
+        self.runtime = dashboard.Runtime()
+        self.handler: AsyncSocketModeHandler | None = None
+        self._dashboard: object | None = None
         self.bot_user_id: str | None = None
         self.team_url: str = ""
         self.answerer: Answerer | None = None
@@ -79,6 +84,7 @@ class SlackQA:
             self.settings.model,
             self.settings.max_answer_tokens,
             base_url=self.settings.openrouter_base_url,
+            temperature=self.settings.temperature,
         )
         self.completer = completer
         self.answerer = Answerer(
@@ -87,7 +93,10 @@ class SlackQA:
             team_url=self.team_url,
             top_k=self.settings.top_k,
             glossary=self.glossary if self.settings.glossary_enabled else None,
+            skill=self.skill,
         )
+        if self.skill:
+            logger.info("Domain skill loaded: %s", self.settings.skill_path)
         logger.info("Authenticated as %s on %s", self.bot_user_id, self.team_url)
         await completer.check_credentials()
         logger.info("Model provider reachable, key accepted (model=%s)", self.settings.model)
@@ -136,6 +145,7 @@ class SlackQA:
                 await self.sync_channel(channel_id)
             except Exception:
                 logger.exception("Sync failed for channel=%s", channel_id)
+        self.runtime.last_sync_at = time.time()
 
     # --------------------------------------------------------------- handlers
 
@@ -234,6 +244,8 @@ class SlackQA:
         logger.info("Glossary HTML written to %s", path)
 
     async def _on_mention(self, event: dict, client) -> None:
+        self.runtime.note_event()
+        self.runtime.note_question()
         channel_id = event["channel"]
         thread_ts = event.get("thread_ts") or event["ts"]
         question = strip_mentions(event.get("text") or "")
@@ -291,6 +303,7 @@ class SlackQA:
 
     async def _on_message(self, event: dict) -> None:
         """Keep the index in step with new messages, edits and deletions."""
+        self.runtime.note_event()
         channel_id = event.get("channel")
         if channel_id not in self.settings.channels:
             return
@@ -336,6 +349,18 @@ class SlackQA:
 
     async def start(self) -> None:
         handler = AsyncSocketModeHandler(self.app, self.settings.slack_app_token)
+        self.handler = handler
+        if self.settings.dashboard_enabled:
+            try:
+                self._dashboard = await dashboard.start(
+                    self, self.settings.dashboard_host, self.settings.dashboard_port
+                )
+            except OSError as e:
+                # A busy port must not stop the bot answering questions.
+                logger.warning(
+                    "Status dashboard not started (port %d): %s",
+                    self.settings.dashboard_port, e,
+                )
         if self.settings.glossary_enabled:
             self._mining_task = asyncio.create_task(self._mining_loop())
             logger.info(
@@ -349,6 +374,8 @@ class SlackQA:
         finally:
             if self._mining_task:
                 self._mining_task.cancel()
+            if self._dashboard is not None:
+                await self._dashboard.cleanup()
 
 
 async def build(settings: Settings) -> SlackQA:

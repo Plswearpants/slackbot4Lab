@@ -36,7 +36,12 @@ class Settings(BaseSettings):
     openrouter_api_key: str
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     model: str = "anthropic/claude-sonnet-5"
-    max_answer_tokens: int = 1024
+    max_answer_tokens: int = 2048
+    # Deterministic by default: the same question on an unchanged index should
+    # give the same answer. Retrieval is already deterministic, so sampling was
+    # the only source of run-to-run variation — and it was large enough to flip
+    # a full evidence list into a refusal.
+    temperature: float = 0.0
 
     # Storage
     data_dir: Path = Path("./data")
@@ -57,6 +62,19 @@ class Settings(BaseSettings):
 
     # Thread memory: how many prior turns of the current thread to carry
     thread_turns: int = 12
+
+    # Domain skill injected into the answering prompt. Tracked in the repo
+    # rather than data/, because it is authored guidance, not derived state.
+    skill_enabled: bool = True
+    skill_path: Path = Path("skills/answering/SKILL.md")
+
+    evals_path: Path = Path("evals/retrieval.yaml")
+
+    # Status dashboard. Localhost by default: the page exposes channel names and
+    # message counts, which are not secret but are not for the network either.
+    dashboard_enabled: bool = True
+    dashboard_host: str = "127.0.0.1"
+    dashboard_port: int = 8765
 
     # Glossary
     glossary_enabled: bool = True

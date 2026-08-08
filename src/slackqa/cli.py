@@ -123,6 +123,68 @@ async def _glossary(action: str, args) -> int:
     return 1
 
 
+async def _eval() -> int:
+    """Measure retrieval recall. No API key needed: embeddings are local."""
+    from slackqa.embeddings import FastEmbedEmbedder
+    from slackqa.evals import format_report, load_cases, run
+    from slackqa.glossary import Glossary
+    from slackqa.retrieval import Retriever
+    from slackqa.store import Store
+
+    settings = get_settings()
+    cases = load_cases(settings.evals_path)
+    if not cases:
+        print(f"No eval cases at {settings.evals_path}")
+        return 1
+
+    store = await Store.open(settings.db_path)
+    retriever = Retriever(
+        store,
+        FastEmbedEmbedder(settings.embed_model),
+        candidates=settings.candidates_per_retriever,
+        rrf_k=settings.rrf_k,
+        min_cosine=settings.relevance_threshold,
+    )
+    glossary = Glossary.load(settings.glossary_path) if settings.glossary_enabled else None
+    results = await run(retriever, cases, settings.top_k, glossary)
+    await store.close()
+
+    print(format_report(results, settings.top_k))
+    return 0 if all(r.passed for r in results) else 1
+
+
+async def _status() -> int:
+    """Print the three dashboard indicators without a browser."""
+    import aiohttp
+
+    settings = get_settings()
+    url = f"http://{settings.dashboard_host}:{settings.dashboard_port}/health"
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                d = await r.json()
+    except Exception:
+        print(f"Listener        DOWN     (no response from {url})")
+        print("Index           unknown  (listener not running)")
+        print("API key         unknown  (listener not running)")
+        return 2
+
+    mark = lambda ok: "OK  " if ok else "DOWN"  # noqa: E731
+    lis, idx, key = d["listener"], d["index"], d["api_key"]
+    print(f"Listener        {mark(lis['ok'])}     {lis['state']}, "
+          f"up {lis['uptime']}, last event {lis['last_event']}")
+    print(f"Index           {mark(idx['ok'])}     newest message {idx['newest_ago']}, "
+          f"last sync {idx['last_sync']}")
+    for c in idx["channels"]:
+        print(f"                         #{c['channel']}: {c['messages']} messages, "
+              f"{c['chunks']} chunks, newest {c['newest_ago']}")
+    print(f"API key         {mark(key['ok'])}     {key['model']}: {key['detail']} "
+          f"(checked {key['checked']})")
+    if key.get("stale"):
+        print("                         A different key is in .env — restart to use it.")
+    return 0 if (lis["ok"] and idx["ok"] and key["ok"]) else 1
+
+
 async def _stats() -> int:
     from slackqa.store import Store
 
@@ -149,6 +211,8 @@ def main() -> None:
     sub.add_parser("run", help="sync, then listen for questions (default)")
     sub.add_parser("sync", help="backfill / catch up / reconcile, then exit")
     sub.add_parser("stats", help="show what is indexed")
+    sub.add_parser("status", help="listener / index / API key indicators")
+    sub.add_parser("eval", help="retrieval recall against evals/retrieval.yaml")
 
     ask = sub.add_parser("ask", help="ask one question from the terminal")
     ask.add_argument("channel")
@@ -190,6 +254,10 @@ def _dispatch(command: str, args, parser) -> int:
         code = asyncio.run(_sync())
     elif command == "stats":
         code = asyncio.run(_stats())
+    elif command == "status":
+        code = asyncio.run(_status())
+    elif command == "eval":
+        code = asyncio.run(_eval())
     elif command == "ask":
         code = asyncio.run(_ask(args.channel, " ".join(args.question)))
     elif command == "glossary":

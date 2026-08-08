@@ -169,6 +169,40 @@ def build_user_prompt(
     return "\n\n".join(sections)
 
 
+def build_search_query(
+    question: str,
+    *,
+    glossary: object | None = None,
+    channel_id: str | None = None,
+    thread: Sequence[Turn] | None = None,
+) -> str:
+    """What to actually search for, which is not always the question.
+
+    A follow-up borrows its subject from earlier in the thread, so short or
+    anaphoric questions fold in the thread's earlier human turns. Matched
+    glossary entries contribute their term, aliases and definition words, which
+    is how a question saying "X-ray spectroscopy" reaches chunks that only ever
+    write ``XRD``. Self-contained questions are searched verbatim — padding them
+    would dilute their own terms.
+
+    Module-level and shared with the eval harness on purpose: a retrieval eval
+    that rebuilt this logic separately would measure a pipeline production does
+    not run.
+    """
+    parts = [question]
+    if thread and needs_thread_context(question):
+        prior = [t.text for t in thread if not t.is_bot][-3:]
+        if prior:
+            parts.extend(prior)
+            logger.info("Follow-up detected; searching with thread context")
+    if glossary is not None:
+        matched = glossary.detect(question, channel_id)
+        expansion = glossary.query_expansion(matched)
+        if expansion:
+            parts.append(expansion)
+    return " ".join(parts)
+
+
 class Answerer:
     def __init__(
         self,
@@ -178,6 +212,7 @@ class Answerer:
         team_url: str,
         top_k: int = 8,
         glossary: object | None = None,
+        skill: object | None = None,
     ) -> None:
         self._retriever = retriever
         self._completer = completer
@@ -186,29 +221,17 @@ class Answerer:
         # Duck-typed rather than imported, so the answerer stays testable
         # without a glossary and the module dependency stays one-way.
         self._glossary = glossary
+        self._skill = skill
 
     def _search_query(
         self, question: str, thread: Sequence[Turn] | None, channel_id: str
     ) -> str:
-        """What to actually search for, which is not always the question.
-
-        A follow-up borrows its subject from earlier in the thread, so for short
-        or anaphoric questions the thread's earlier *human* turns are folded in.
-        Self-contained questions are searched verbatim — padding them would only
-        dilute their own terms.
-        """
-        parts = [question]
-        if thread and needs_thread_context(question):
-            prior = [t.text for t in thread if not t.is_bot][-3:]
-            if prior:
-                parts.extend(prior)
-                logger.info("Follow-up detected; searching with thread context")
-        if self._glossary is not None:
-            hits = self._glossary.detect(question, channel_id)
-            expansion = self._glossary.query_expansion(hits)
-            if expansion:
-                parts.append(expansion)
-        return " ".join(parts)
+        return build_search_query(
+            question,
+            glossary=self._glossary,
+            channel_id=channel_id,
+            thread=thread,
+        )
 
     def _glossary_block(self, question: str, channel_id: str) -> str:
         if self._glossary is None:
@@ -248,6 +271,13 @@ class Answerer:
 
         return _finalize(reply, hits, searches=1)
 
+    def _system(self) -> str:
+        """Base rules plus the domain skill, re-read if it changed on disk."""
+        body = getattr(self._skill, "body", "") if self._skill is not None else ""
+        if not body:
+            return SYSTEM_PROMPT
+        return f"{SYSTEM_PROMPT}\n\n--- Domain guidance for this workspace ---\n\n{body}"
+
     async def _ask(
         self,
         channel_id: str,
@@ -264,7 +294,7 @@ class Answerer:
             thread=thread,
             glossary_block=glossary_block,
         )
-        return (await self._completer.complete(SYSTEM_PROMPT, user)).strip()
+        return (await self._completer.complete(self._system(), user)).strip()
 
 
 def _refusal_text() -> str:
@@ -296,6 +326,7 @@ class OpenRouterCompleter:
         model: str,
         max_tokens: int = 1024,
         base_url: str = "https://openrouter.ai/api/v1",
+        temperature: float = 0.0,
     ) -> None:
         from openai import AsyncOpenAI
 
@@ -311,6 +342,7 @@ class OpenRouterCompleter:
         )
         self._model = model
         self._max_tokens = max_tokens
+        self._temperature = temperature
         self._api_key = api_key
         self._base_url = base_url
 
@@ -341,6 +373,7 @@ class OpenRouterCompleter:
         resp = await self._client.chat.completions.create(
             model=self._model,
             max_tokens=self._max_tokens,
+            temperature=self._temperature,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},

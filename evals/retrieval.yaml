@@ -1,0 +1,52 @@
+# Retrieval evals — does the evidence needed to answer reach the prompt?
+#
+# Runs offline against local embeddings: no API key, no spend, no sampling
+# variance. Run it after touching chunking, fusion weights, the stopword list,
+# or the embedding model — the changes most likely to break retrieval silently.
+#
+#   ./slackqa eval
+#
+# Each case asserts that certain strings appear somewhere in the retrieved
+# chunks. Keep them short and distinctive: an acronym, a part number, a
+# surname. They are matched case-insensitively as substrings.
+#
+# Seeded from real questions in the query_log. Add a case whenever the bot
+# misses something you know is in the channel — that is the cheapest possible
+# regression test, and it needs no model.
+
+- question: I remember we have X-ray spectroscopy taken on the material, what did it report?
+  channel: C3TVD4DK6
+  must_retrieve: [XRD]
+  why: >-
+    Refused in production while the answer sat in the index. People say
+    "X-ray spectroscopy"; the channel writes XRD/EDX. If this regresses, the
+    technique-acronym table in the skill has stopped doing its job.
+
+- question: Give me a comprehensive list of evidence on the blue goo
+  channel: C3TVD4DK6
+  must_retrieve: [blue, XRD]
+  why: >-
+    Evidence collection spans years and message types. Needs both the visual
+    reports and the 2023-09-29 XRD attempt to be answerable as a dossier
+    rather than a single observation.
+
+- question: what is the status of the heat shield?
+  channel: CLXDY4AK1
+  must_retrieve: [shield]
+  why: Status question against a glossary term with a live status snapshot.
+
+- question: what is the status of the electronic breakout box?
+  channel: CLXDY4AK1
+  must_retrieve: [BNC]
+  why: >-
+    The answer hinges on a specification — connector types and counts — that
+    must survive chunking intact to be transcribed correctly.
+
+- question: what did we decide about the orders table?
+  channel: CLXDY4AK1
+  must_retrieve: []
+  why: >-
+    Deliberately unanswerable: nothing in this lab's channels concerns an
+    orders table. Retrieval always returns something, so this case exists to
+    be inspected by eye, not to assert. It documents that refusing here is
+    the generation layer's job, not retrieval's.

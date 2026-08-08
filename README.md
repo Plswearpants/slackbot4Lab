@@ -224,6 +224,36 @@ its own topic isn't shared vocabulary. Candidates are frequent multi-word
 phrases and acronyms; a single batched triage call classifies the shortlist
 before any definition is paid for.
 
+## Domain skill
+
+`skills/answering/SKILL.md` carries lab-specific answering guidance and is
+appended to the system prompt. It is a normal `SKILL.md` — frontmatter plus a
+Markdown body — and only the body is sent; `name` and `description` exist for
+humans and tooling.
+
+Edit it and the change applies to the **next question**; the file is re-read
+when its mtime changes, so there is no restart in the loop.
+
+It deliberately contains only what the model cannot infer:
+
+- **Instrument nicknames.** Beast, Tesla, Omi, Joel the Jeol, Createc read as
+  ordinary English and are unguessable as hardware.
+- **Channel-to-instrument binding.** In `#createc`, "the machine" means the
+  Createc.
+- **How to read lab chatter.** Dates supersede; negative results are results;
+  copy part numbers and specs verbatim.
+- **What each question type actually asks for**, drawn from the real query log.
+
+Nothing in it repeats the base prompt. The test for adding a line is whether it
+changes behaviour versus the default — grounding, citation and refusal rules are
+already handled and would be pure token cost here.
+
+One entry earned its place by measurement. "I remember we have X-ray
+spectroscopy on the material" was refused even though the answer was indexed,
+because the channel writes **XRD**, not "X-ray spectroscopy". The skill now maps
+spoken technique names to their acronyms and tells the model to spend its one
+refinement search on them; the same question now answers correctly.
+
 ## What isn't indexed
 
 The corpus is what humans said to each other. Excluded: the bot's own replies
@@ -235,7 +265,7 @@ Slack system messages.
 
 ```bash
 uv sync
-uv run pytest          # 189 tests, no network, no model download
+uv run pytest          # 221 tests, no network, no model download
 uv run ruff check .
 ```
 
@@ -271,6 +301,10 @@ in that tree.
 | `DATA_DIR` | `./data` | SQLite database location |
 | `CHUNK_GAP_SECONDS` | `600` | Gap that starts a new window chunk |
 | `TOP_K` | `8` | Chunks sent to the model |
+| `SKILL_ENABLED` | `true` | Append the domain skill to the system prompt |
+| `SKILL_PATH` | `skills/answering/SKILL.md` | Where that skill lives |
+| `TEMPERATURE` | `0.0` | Sampling temperature; 0 keeps answers stable run to run |
+| `MAX_ANSWER_TOKENS` | `2048` | Evidence-collection answers need the headroom |
 | `CANDIDATES_PER_RETRIEVER` | `30` | Candidates each retriever contributes |
 | `RRF_K` | `60` | Reciprocal Rank Fusion constant |
 | `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed model |

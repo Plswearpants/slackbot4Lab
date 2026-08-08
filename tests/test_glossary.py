@@ -260,3 +260,21 @@ def test_html_shows_scope(tmp_path):
     out = render_html(gl(tmp_path, SCOPED).entries, channel_names={"C4PROBE": "4probe"})
     assert "#4probe" in out
     assert "all channels" in out
+
+
+def test_query_expansion_leads_with_the_term_itself(tmp_path):
+    # The bug this exists to prevent: expansion drawn only from the definition
+    # dropped "XRD" — the one token a question saying "X-ray spectroscopy"
+    # needed to reach chunks that only ever write the acronym.
+    g = gl(tmp_path, "## XRD\n\nX-ray diffraction for material identification.\n")
+    expansion = g.query_expansion(g.detect("XRD"))
+    assert expansion.split()[0] == "XRD"
+
+
+def test_query_expansion_includes_aliases(tmp_path):
+    g = gl(
+        tmp_path,
+        "## XRD\n\nDiffraction.\n\n- aliases: XPS, EDX\n",
+    )
+    expansion = g.query_expansion(g.detect("XRD")).split()
+    assert {"XRD", "XPS", "EDX"} <= set(expansion)

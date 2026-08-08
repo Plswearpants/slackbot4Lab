@@ -379,12 +379,27 @@ class Glossary:
         )
 
     def query_expansion(self, entries: list[Entry], max_words: int = 12) -> str:
-        """Extra search terms drawn from definitions, to help retrieval."""
+        """Extra search terms for a matched entry, most valuable first.
+
+        The term and its aliases lead. A question that says "X-ray
+        spectroscopy" needs the token ``XRD`` added to reach chunks that only
+        ever write the acronym — and that token appears nowhere in the entry's
+        prose. Drawing expansion from the definition alone dropped precisely
+        the word the search was missing.
+        """
         words: list[str] = []
-        for e in entries:
-            for tok in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.\-]{2,}", e.definition):
+
+        def add(text: str) -> None:
+            for tok in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.\-]{2,}", text):
                 if tok.lower() not in {w.lower() for w in words}:
                     words.append(tok)
+
+        for e in entries:
+            add(e.term)
+            for alias in e.aliases:
+                add(alias)
+        for e in entries:
+            add(e.definition)
         return " ".join(words[:max_words])
 
 

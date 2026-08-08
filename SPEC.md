@@ -141,6 +141,21 @@ OpenAI-compatible API. Same model; the provider is an entry point, not a
 change of behaviour. `MODEL` accepts any OpenRouter slug, so swapping is
 configuration rather than code.
 
+### Domain skill
+
+`skills/answering/SKILL.md` is appended to the system prompt, carrying knowledge
+the model cannot infer: instrument nicknames that read as ordinary English, the
+binding from channel to instrument, conventions for reading experimental
+chatter, and what each observed question type actually asks for. It is re-read
+when its mtime changes so guidance can be tuned without a restart.
+
+The admission test for a line is whether it changes behaviour versus the
+default; anything the base prompt already covers is excluded as pure token cost.
+
+Sampling is pinned to temperature 0. Retrieval was already deterministic, so
+sampling was the sole source of run-to-run variation — and it was large enough
+to flip a full evidence list into a refusal on identical input.
+
 ### Grounding
 
 - Every claim cites a Slack permalink to its source message.
