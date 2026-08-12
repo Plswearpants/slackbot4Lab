@@ -314,6 +314,41 @@ because the channel writes **XRD**, not "X-ray spectroscopy". The skill now maps
 spoken technique names to their acronyms and tells the model to spend its one
 refinement search on them; the same question now answers correctly.
 
+## Literature filing
+
+Papers shared in a channel are catalogued into a Zotero group collection named
+after that channel, created on first use.
+
+```bash
+./slackqa lit scan --dry-run     # resolve everything, write nothing
+./slackqa lit scan --limit 10    # file the 10 most recent new papers
+./slackqa lit pending            # papers still needing a PDF
+```
+
+Three tiers, ordered by what is actually legal rather than what is technically
+possible:
+
+| Tier | Source | Result |
+|---|---|---|
+| Metadata, always | Crossref, arXiv | Correctly-typed item even when paywalled |
+| PDF when free | arXiv direct, Unpaywall | File attached |
+| Otherwise | — | Link attachment + `needs-pdf`, queued for a human |
+
+**No automated fetching through institutional subscriptions.** It is technically
+possible — a headless browser with your credentials would work — but publishers
+prohibit systematic downloading and enforce it against the institution's whole
+IP range. The cost of being caught falls on everyone at UBC, not on the bot.
+Paywalled papers are therefore left to a person with the Zotero Connector, which
+runs in their own authenticated browser and is the right tool for that job.
+
+Every item the bot creates is tagged **`added-by:LAIRbot`**, so a bad run is one
+saved search away from being reviewed or undone — this is a library the whole
+group shares. Writing stays off until `ZOTERO_WRITE_ENABLED=true`, and
+`--dry-run` resolves everything without touching Zotero.
+
+`LITERATURE_CHANNELS` is separate from `CHANNELS`: a paper-sharing channel is
+not necessarily one the bot answers questions about.
+
 ## What isn't indexed
 
 The corpus is what humans said to each other. Excluded: the bot's own replies
@@ -325,7 +360,7 @@ Slack system messages.
 
 ```bash
 uv sync
-uv run pytest          # 241 tests, no network, no model download
+uv run pytest          # 265 tests, no network, no model download
 uv run ruff check .
 ```
 
@@ -374,6 +409,12 @@ in that tree.
 | `GLOSSARY_UPDATE_HOURS` | `24` | How often the listener mines for new terms |
 | `GLOSSARY_MAX_NEW_TERMS` | `5` | Cap on terms drafted per mining pass |
 | `GLOSSARY_MIN_CONVERSATIONS` | `3` | Distinct conversations a term must span |
+| `ZOTERO_API_KEY` | — | Key with write access to the group |
+| `ZOTERO_GROUP_ID` | — | Number in `zotero.org/groups/<id>/` |
+| `ZOTERO_WRITE_ENABLED` | `false` | Must be on before anything is written |
+| `LITERATURE_CHANNELS` | — | Channels scanned for papers |
+| `LITERATURE_MAX_ITEMS` | `10` | Cap on new papers per scan |
+| `UNPAYWALL_EMAIL` | — | Contact address Unpaywall requires |
 | `GLOSSARY_REFRESH_DAYS` | `7` | Age at which a status snapshot is re-derived |
 | `GLOSSARY_MAX_REFRESH` | `5` | Cap on snapshots refreshed per pass |
 

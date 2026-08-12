@@ -70,6 +70,18 @@ class Settings(BaseSettings):
 
     evals_path: Path = Path("evals/retrieval.yaml")
 
+    # Zotero. Writes land in a library the whole lab shares, so the write path
+    # stays off until switched on deliberately.
+    zotero_api_key: str = ""
+    zotero_group_id: str = ""
+    zotero_write_enabled: bool = False
+    # Only these channels are scanned for papers — a paper-sharing channel is a
+    # different thing from a channel the bot answers questions about.
+    literature_channels: Annotated[list[str], NoDecode] = []
+    literature_max_items: int = 10
+    # Unpaywall requires a contact address on every request; it has no API key.
+    unpaywall_email: str = ""
+
     # Status dashboard. Localhost by default: the page exposes channel names and
     # message counts, which are not secret but are not for the network either.
     dashboard_enabled: bool = True
@@ -89,7 +101,7 @@ class Settings(BaseSettings):
     # deletions that happened while the process was down.
     reconcile_window_days: int = 30
 
-    @field_validator("channels", mode="before")
+    @field_validator("channels", "literature_channels", mode="before")
     @classmethod
     def _split_channels(cls, v: object) -> object:
         if isinstance(v, str):

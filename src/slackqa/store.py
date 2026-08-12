@@ -67,6 +67,18 @@ CREATE TABLE IF NOT EXISTS users (
     cached_at    REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS literature (
+    identity    TEXT PRIMARY KEY,       -- DOI, arXiv id, or URL
+    channel_id  TEXT NOT NULL,
+    title       TEXT NOT NULL DEFAULT '',
+    zotero_key  TEXT,
+    has_pdf     INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL,          -- added | needs-pdf | unresolved
+    detail      TEXT NOT NULL DEFAULT '',
+    source_ts   TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS query_expansions (
     question   TEXT PRIMARY KEY,
     terms      TEXT NOT NULL,
@@ -419,6 +431,55 @@ class Store:
             (user_id, display_name, at),
         )
         await self._db.commit()
+
+    # ------------------------------------------------------------- literature
+
+    async def seen_reference(self, identity: str) -> bool:
+        async with self._db.execute(
+            "SELECT 1 FROM literature WHERE identity = ?", (identity,)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def record_reference(
+        self,
+        identity: str,
+        channel_id: str,
+        status: str,
+        *,
+        title: str = "",
+        zotero_key: str | None = None,
+        has_pdf: bool = False,
+        detail: str = "",
+        source_ts: str = "",
+    ) -> None:
+        import time as _time
+
+        await self._db.execute(
+            """INSERT INTO literature
+               (identity, channel_id, title, zotero_key, has_pdf, status, detail,
+                source_ts, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(identity) DO UPDATE SET
+                   status = excluded.status, zotero_key = excluded.zotero_key,
+                   has_pdf = excluded.has_pdf, detail = excluded.detail,
+                   title = excluded.title""",
+            (identity, channel_id, title[:400], zotero_key, int(has_pdf), status,
+             detail[:400], source_ts, _time.time()),
+        )
+        await self._db.commit()
+
+    async def literature_by_status(self, status: str) -> list[dict[str, Any]]:
+        async with self._db.execute(
+            "SELECT * FROM literature WHERE status = ? ORDER BY created_at DESC",
+            (status,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def literature_counts(self) -> dict[str, int]:
+        async with self._db.execute(
+            "SELECT status, COUNT(*) AS n FROM literature GROUP BY status"
+        ) as cur:
+            return {r["status"]: r["n"] for r in await cur.fetchall()}
 
     # -------------------------------------------------------- query expansion
 

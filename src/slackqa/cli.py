@@ -124,6 +124,70 @@ async def _glossary(action: str, args) -> int:
     return 1
 
 
+async def _lit(action: str, args) -> int:
+    from slackqa.store import Store
+
+    settings = get_settings()
+    store = await Store.open(settings.db_path)
+
+    if action == "pending":
+        rows = await store.literature_by_status("needs-pdf")
+        counts = await store.literature_counts()
+        if not rows:
+            print("Nothing waiting for a PDF.")
+        for r in rows:
+            print(f"  {r['title'][:66]}")
+            print(f"     {r['identity']}")
+        print()
+        print("  ".join(f"{k}: {v}" for k, v in sorted(counts.items())) or "(nothing yet)")
+        if rows:
+            print("\nOpen these in a browser and save with the Zotero Connector —")
+            print("it uses your own session, so it reaches what a server should not.")
+        await store.close()
+        return 0
+
+    if action == "scan":
+        from slack_sdk.web.async_client import AsyncWebClient
+
+        from slackqa.librarian import format_report, scan_channel
+        from slackqa.zotero import Zotero
+
+        if not settings.literature_channels:
+            print("No LITERATURE_CHANNELS configured.")
+            await store.close()
+            return 1
+        if not (settings.zotero_api_key and settings.zotero_group_id):
+            print("Set ZOTERO_API_KEY and ZOTERO_GROUP_ID in .env")
+            await store.close()
+            return 1
+
+        dry = args.dry_run
+        if not dry and not settings.zotero_write_enabled:
+            print("Writing is off. Set ZOTERO_WRITE_ENABLED=true in .env, or")
+            print("re-run with --dry-run to see what would be filed.")
+            await store.close()
+            return 1
+
+        slack = AsyncWebClient(token=settings.slack_bot_token)
+        zot = Zotero(settings.zotero_api_key, settings.zotero_group_id)
+        limit = args.limit or settings.literature_max_items
+
+        for channel_id in settings.literature_channels:
+            info = (await slack.conversations_info(channel=channel_id))["channel"]
+            name = info.get("name") or channel_id
+            outcomes = await scan_channel(
+                store, slack, zot, channel_id, name,
+                unpaywall_email=settings.unpaywall_email,
+                limit=limit, dry_run=dry, oldest_first=args.oldest_first,
+            )
+            print(format_report(outcomes, name + (" (dry run)" if dry else "")))
+        await store.close()
+        return 0
+
+    await store.close()
+    return 1
+
+
 async def _eval() -> int:
     """Measure retrieval recall. No API key needed: embeddings are local."""
     from slackqa.embeddings import FastEmbedEmbedder
@@ -218,6 +282,15 @@ def main() -> None:
     sub.add_parser("status", help="listener / index / API key indicators")
     sub.add_parser("eval", help="retrieval recall against evals/retrieval.yaml")
 
+    lit = sub.add_parser("lit", help="file shared papers into Zotero")
+    lsub = lit.add_subparsers(dest="action")
+    ls = lsub.add_parser("scan", help="scan whitelisted channels for papers")
+    ls.add_argument("--limit", type=int, help="max new papers this run")
+    ls.add_argument("--dry-run", action="store_true", help="resolve but write nothing")
+    ls.add_argument("--oldest-first", action="store_true",
+                    help="work forward from the oldest papers instead of the newest")
+    lsub.add_parser("pending", help="papers needing a human to fetch the PDF")
+
     ask = sub.add_parser("ask", help="ask one question from the terminal")
     ask.add_argument("channel")
     ask.add_argument("question", nargs="+")
@@ -264,6 +337,12 @@ def _dispatch(command: str, args, parser) -> int:
         code = asyncio.run(_status())
     elif command == "eval":
         code = asyncio.run(_eval())
+    elif command == "lit":
+        if not getattr(args, "action", None):
+            print("Usage: slackqa lit {scan,pending}")
+            code = 1
+        else:
+            code = asyncio.run(_lit(args.action, args))
     elif command == "ask":
         code = asyncio.run(_ask(args.channel, " ".join(args.question), args.deep))
     elif command == "glossary":
