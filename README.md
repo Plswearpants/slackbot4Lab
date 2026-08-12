@@ -103,6 +103,39 @@ requests/minute — so a channel with ~500 threads takes ~10 minutes. Measured o
 a real channel: 2,484 messages → 1,164 chunks in 10m16s. It's one-time; progress
 is logged every 25 threads. Later starts only fetch what changed.
 
+## Running it
+
+For a session, in your own terminal:
+
+```bash
+./slackqa run
+```
+
+To keep it up — starts at login, restarts if it dies or the network drops it:
+
+```bash
+./scripts/install-launchd.sh          # install and start
+./scripts/install-launchd.sh remove   # stop and unregister
+```
+
+Logs go to `~/Library/Logs/slackqa.log`. Check health with `./slackqa status`
+or <http://127.0.0.1:8765>.
+
+**Run only one listener at a time.** Two processes both answer every
+`@mention`, so the bot replies twice. The second one also finds port 8765 taken
+and logs a warning, which is the easiest way to notice you have two.
+
+**Settings are read once at startup.** Editing `.env` — including rotating the
+API key — takes effect only after a restart:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.lairbot.slackqa
+```
+
+The dashboard detects this: when `.env` holds a different key than the running
+process, the API key card turns amber and says *restart needed* rather than
+reporting the key as rejected.
+
 ## Commands
 
 | Command | Does |
@@ -224,6 +257,33 @@ its own topic isn't shared vocabulary. Candidates are frequent multi-word
 phrases and acronyms; a single batched triage call classifies the shortlist
 before any definition is paid for.
 
+## Deep search
+
+Dense retrieval absorbs a lot of vague phrasing on its own — "that blue sticky
+stuff" finds the right conversation unaided. What it loses is *specific*
+evidence. Asked "did we ever figure out what that gunk was", the bot correctly
+said nothing was confirmed but never surfaced the XRD attempt, and the
+refinement round did not rescue it: a model satisfied with plausible excerpts
+has no way to know what it was not shown.
+
+Put `deep` in front of a question and one model call rewrites it into the
+channel's own vocabulary before retrieval runs:
+
+```
+@LAIRbot deep did we ever figure out what that gunk was
+```
+
+`dig` and `search harder` work too, and `slackqa ask --deep` from the terminal.
+
+The rewriter is given this channel's glossary terms and aliases as candidate
+targets, which is what lets "gunk" land on a term the channel actually uses.
+Expansions are cached by question text, so a repeated question costs nothing.
+
+It is opt-in on purpose. Ordinary questions keep the free, deterministic path —
+which is also what keeps `slackqa eval` offline, instant, and runnable on every
+change. An LLM in the default retrieval path would force evals to either spend
+money or test a pipeline production does not run.
+
 ## Domain skill
 
 `skills/answering/SKILL.md` carries lab-specific answering guidance and is
@@ -265,7 +325,7 @@ Slack system messages.
 
 ```bash
 uv sync
-uv run pytest          # 221 tests, no network, no model download
+uv run pytest          # 241 tests, no network, no model download
 uv run ruff check .
 ```
 

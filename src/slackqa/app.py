@@ -94,6 +94,7 @@ class SlackQA:
             top_k=self.settings.top_k,
             glossary=self.glossary if self.settings.glossary_enabled else None,
             skill=self.skill,
+            store=self.store,
         )
         if self.skill:
             logger.info("Domain skill loaded: %s", self.settings.skill_path)

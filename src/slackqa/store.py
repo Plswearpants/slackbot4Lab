@@ -67,6 +67,12 @@ CREATE TABLE IF NOT EXISTS users (
     cached_at    REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS query_expansions (
+    question   TEXT PRIMARY KEY,
+    terms      TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS query_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_id  TEXT NOT NULL,
@@ -411,6 +417,27 @@ class Store:
                ON CONFLICT(user_id) DO UPDATE SET
                    display_name = excluded.display_name, cached_at = excluded.cached_at""",
             (user_id, display_name, at),
+        )
+        await self._db.commit()
+
+    # -------------------------------------------------------- query expansion
+
+    async def get_expansion(self, question: str) -> str | None:
+        async with self._db.execute(
+            "SELECT terms FROM query_expansions WHERE question = ?", (question.strip(),)
+        ) as cur:
+            row = await cur.fetchone()
+            return row["terms"] if row else None
+
+    async def put_expansion(self, question: str, terms: str) -> None:
+        import time as _time
+
+        await self._db.execute(
+            """INSERT INTO query_expansions (question, terms, created_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(question) DO UPDATE SET
+                   terms = excluded.terms, created_at = excluded.created_at""",
+            (question.strip(), terms, _time.time()),
         )
         await self._db.commit()
 

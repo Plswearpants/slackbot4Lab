@@ -88,12 +88,17 @@ class StatusProbe:
 
     # ------------------------------------------------------------ indicators
 
-    def listener(self) -> dict[str, Any]:
+    async def listener(self) -> dict[str, Any]:
         bot = self._bot
         connected = False
         try:
             client = getattr(bot.handler, "client", None)
-            connected = bool(client and client.is_connected())
+            if client is not None:
+                # is_connected() is a coroutine on the aiohttp Socket Mode
+                # client. Calling it without awaiting yields a coroutine
+                # object, which is always truthy — the indicator reported
+                # "connected" unconditionally and could never go red.
+                connected = bool(await client.is_connected())
         except Exception:  # pragma: no cover - defensive
             connected = False
 
@@ -206,7 +211,7 @@ class StatusProbe:
 
     async def snapshot(self) -> dict[str, Any]:
         return {
-            "listener": self.listener(),
+            "listener": await self.listener(),
             "index": await self.index(),
             "api_key": await self.api_key(),
             "generated": _stamp(time.time()),

@@ -385,3 +385,46 @@ async def test_answerer_works_without_a_glossary(store, embedder):
     await seed(store, embedder, [mk("postgres", 100)])
     ans = await make(store, embedder, ScriptedCompleter("fine")).answer(CH, "db?")
     assert ans.refused is False
+
+
+# ------------------------------------------------------ credential hot-reload
+
+
+async def test_rotated_key_is_picked_up_without_restart(tmp_path, monkeypatch):
+    """Replacing a dead key in .env used to require a restart — hit twice."""
+    from slackqa.answerer import OpenRouterCompleter
+
+    monkeypatch.chdir(tmp_path)
+    env = tmp_path / ".env"
+    env.write_text("OPENROUTER_API_KEY=sk-or-old\n")
+
+    c = OpenRouterCompleter("sk-or-old", "anthropic/claude-sonnet-5")
+    assert c._reload_key_if_changed() is False  # unchanged
+
+    import os
+    import time
+
+    env.write_text("OPENROUTER_API_KEY=sk-or-new\n")
+    os.utime(env, (time.time() + 1, time.time() + 1))
+
+    class Fresh:
+        openrouter_api_key = "sk-or-new"
+        model = "anthropic/claude-sonnet-5"
+
+    monkeypatch.setattr("slackqa.config.Settings", lambda: Fresh())
+    assert c._reload_key_if_changed() is True
+    assert c._api_key == "sk-or-new"
+
+
+async def test_untouched_env_costs_only_a_stat(tmp_path, monkeypatch):
+    from slackqa.answerer import OpenRouterCompleter
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("OPENROUTER_API_KEY=sk-or-x\n")
+    c = OpenRouterCompleter("sk-or-x", "m")
+
+    def boom():
+        raise AssertionError("Settings must not be re-read when .env is unchanged")
+
+    monkeypatch.setattr("slackqa.config.Settings", boom)
+    assert c._reload_key_if_changed() is False

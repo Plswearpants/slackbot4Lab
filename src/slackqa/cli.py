@@ -45,17 +45,18 @@ async def _sync() -> int:
     return 0
 
 
-async def _ask(channel_id: str, question: str) -> int:
+async def _ask(channel_id: str, question: str, deep: bool = False) -> int:
     """Answer one question from the terminal — no Slack round trip."""
     from slackqa.app import build
 
     settings = get_settings()
     bot = await build(settings)
     assert bot.answerer is not None
-    answer = await bot.answerer.answer(channel_id, question)
+    answer = await bot.answerer.answer(channel_id, question, deep=deep)
     print(answer.text)
     print(f"\n[{'refused' if answer.refused else 'answered'} | "
-          f"{len(answer.chunk_ids)} chunks | {answer.searches} search(es)]")
+          f"{len(answer.chunk_ids)} chunks | {answer.searches} search(es)"
+          f"{' | deep' if answer.deep else ''}]")
     await bot.store.close()
     return 0
 
@@ -164,9 +165,12 @@ async def _status() -> int:
             async with http.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 d = await r.json()
     except Exception:
-        print(f"Listener        DOWN     (no response from {url})")
-        print("Index           unknown  (listener not running)")
-        print("API key         unknown  (listener not running)")
+        print(f"Listener        UNKNOWN  no response from {url}")
+        print("                         Either no listener is running, or one is")
+        print("                         running without its dashboard because the")
+        print("                         port was already taken at startup.")
+        print("Index           unknown  (cannot reach the listener)")
+        print("API key         unknown  (cannot reach the listener)")
         return 2
 
     mark = lambda ok: "OK  " if ok else "DOWN"  # noqa: E731
@@ -217,6 +221,8 @@ def main() -> None:
     ask = sub.add_parser("ask", help="ask one question from the terminal")
     ask.add_argument("channel")
     ask.add_argument("question", nargs="+")
+    ask.add_argument("--deep", action="store_true",
+                     help="expand the query with an LLM before searching")
 
     gl = sub.add_parser("glossary", help="shared vocabulary the bot consults")
     gsub = gl.add_subparsers(dest="action")
@@ -259,7 +265,7 @@ def _dispatch(command: str, args, parser) -> int:
     elif command == "eval":
         code = asyncio.run(_eval())
     elif command == "ask":
-        code = asyncio.run(_ask(args.channel, " ".join(args.question)))
+        code = asyncio.run(_ask(args.channel, " ".join(args.question), args.deep))
     elif command == "glossary":
         if not getattr(args, "action", None):
             print("Usage: slackqa glossary {list,html,update,endorse,add}")

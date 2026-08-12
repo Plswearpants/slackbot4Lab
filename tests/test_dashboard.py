@@ -14,10 +14,14 @@ CH = "C0TEST"
 
 
 class FakeSocket:
+    """Matches the real aiohttp Socket Mode client, where is_connected is a
+    coroutine. A synchronous fake here let a real bug through: the unawaited
+    call returned a truthy coroutine and the indicator was green forever."""
+
     def __init__(self, connected: bool):
         self._connected = connected
 
-    def is_connected(self) -> bool:
+    async def is_connected(self) -> bool:
         return self._connected
 
 
@@ -77,7 +81,7 @@ def test_duration_formats():
 
 
 async def test_listener_up_when_socket_connected(store):
-    s = StatusProbe(FakeBot(store, connected=True)).listener()
+    s = await StatusProbe(FakeBot(store, connected=True)).listener()
     assert s["ok"] is True
     assert s["state"] == "connected"
 
@@ -85,7 +89,7 @@ async def test_listener_up_when_socket_connected(store):
 async def test_listener_flags_dropped_socket(store):
     # The process answering this request is alive by definition; the useful
     # signal is that its websocket has gone.
-    s = StatusProbe(FakeBot(store, connected=False)).listener()
+    s = await StatusProbe(FakeBot(store, connected=False)).listener()
     assert s["ok"] is False
     assert "socket down" in s["state"]
 
@@ -94,13 +98,13 @@ async def test_listener_reports_last_event_and_question(store):
     bot = FakeBot(store)
     bot.runtime.note_event()
     bot.runtime.note_question()
-    s = StatusProbe(bot).listener()
+    s = await StatusProbe(bot).listener()
     assert s["last_event"].endswith("ago")
     assert s["last_question"].endswith("ago")
 
 
 async def test_listener_never_seen_events(store):
-    assert StatusProbe(FakeBot(store)).listener()["last_event"] == "never"
+    assert (await StatusProbe(FakeBot(store)).listener())["last_event"] == "never"
 
 
 async def test_index_reports_counts_and_recency(store):
@@ -242,3 +246,12 @@ async def test_matching_key_is_not_stale(store, monkeypatch):
 
     monkeypatch.setattr("slackqa.config.Settings", lambda: Same())
     assert (await probe.api_key())["stale"] is False
+
+
+async def test_indicator_can_actually_go_red(store):
+    """Regression: is_connected is a coroutine, so an unawaited call was always
+    truthy and this indicator could never report a dropped socket."""
+    up = await StatusProbe(FakeBot(store, connected=True)).listener()
+    down = await StatusProbe(FakeBot(store, connected=False)).listener()
+    assert up["ok"] is True
+    assert down["ok"] is False, "the listener card must be able to go red"

@@ -18,6 +18,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Protocol
 
 from slackqa.retrieval import Hit, Retriever
@@ -111,6 +112,7 @@ class Answer:
     refused: bool = False
     chunk_ids: list[int] = field(default_factory=list)
     searches: int = 1
+    deep: bool = False
 
 
 def permalink(team_url: str, channel_id: str, ts: str) -> str:
@@ -175,6 +177,7 @@ def build_search_query(
     glossary: object | None = None,
     channel_id: str | None = None,
     thread: Sequence[Turn] | None = None,
+    expansion: str = "",
 ) -> str:
     """What to actually search for, which is not always the question.
 
@@ -197,9 +200,11 @@ def build_search_query(
             logger.info("Follow-up detected; searching with thread context")
     if glossary is not None:
         matched = glossary.detect(question, channel_id)
-        expansion = glossary.query_expansion(matched)
-        if expansion:
-            parts.append(expansion)
+        gloss_terms = glossary.query_expansion(matched)
+        if gloss_terms:
+            parts.append(gloss_terms)
+    if expansion:
+        parts.append(expansion)
     return " ".join(parts)
 
 
@@ -213,6 +218,7 @@ class Answerer:
         top_k: int = 8,
         glossary: object | None = None,
         skill: object | None = None,
+        store: object | None = None,
     ) -> None:
         self._retriever = retriever
         self._completer = completer
@@ -222,15 +228,21 @@ class Answerer:
         # without a glossary and the module dependency stays one-way.
         self._glossary = glossary
         self._skill = skill
+        self._store = store
 
     def _search_query(
-        self, question: str, thread: Sequence[Turn] | None, channel_id: str
+        self,
+        question: str,
+        thread: Sequence[Turn] | None,
+        channel_id: str,
+        expansion: str = "",
     ) -> str:
         return build_search_query(
             question,
             glossary=self._glossary,
             channel_id=channel_id,
             thread=thread,
+            expansion=expansion,
         )
 
     def _glossary_block(self, question: str, channel_id: str) -> str:
@@ -246,14 +258,32 @@ class Answerer:
         question: str,
         *,
         thread: Sequence[Turn] | None = None,
+        deep: bool = False,
     ) -> Answer:
+        from slackqa.expansion import expand, strip_trigger, wants_expansion
+
+        deep = deep or wants_expansion(question)
+        question = strip_trigger(question)
+
+        expansion = ""
+        if deep:
+            expansion = await expand(
+                question,
+                self._completer,
+                glossary=self._glossary,
+                channel_id=channel_id,
+                store=self._store,
+            )
+
         gloss = self._glossary_block(question, channel_id)
-        query = self._search_query(question, thread, channel_id)
+        query = self._search_query(question, thread, channel_id, expansion)
 
         hits = await self._retriever.retrieve(channel_id, query, self._top_k)
         if not hits:
             # Nothing indexed matched at all — refuse without spending a call.
-            return Answer(text=_refusal_text(), refused=True, chunk_ids=[], searches=1)
+            return Answer(
+                text=_refusal_text(), refused=True, chunk_ids=[], searches=1, deep=deep
+            )
 
         reply = await self._ask(channel_id, question, hits, thread, gloss)
 
@@ -267,9 +297,9 @@ class Answerer:
             # Second and final pass; any further SEARCH line is ignored below.
             reply = await self._ask(channel_id, question, hits, thread, gloss)
             reply = _SEARCH_RE.sub("", reply).strip()
-            return _finalize(reply, hits, searches=2)
+            return _finalize(reply, hits, searches=2, deep=deep)
 
-        return _finalize(reply, hits, searches=1)
+        return _finalize(reply, hits, searches=1, deep=deep)
 
     def _system(self) -> str:
         """Base rules plus the domain skill, re-read if it changed on disk."""
@@ -304,11 +334,17 @@ def _refusal_text() -> str:
     )
 
 
-def _finalize(reply: str, hits: Sequence[Hit], searches: int) -> Answer:
+def _finalize(
+    reply: str, hits: Sequence[Hit], searches: int, deep: bool = False
+) -> Answer:
     ids = [h.chunk_id for h in hits]
     if not reply or reply.strip() == NO_ANSWER:
-        return Answer(text=_refusal_text(), refused=True, chunk_ids=ids, searches=searches)
-    return Answer(text=reply, refused=False, chunk_ids=ids, searches=searches)
+        return Answer(
+            text=_refusal_text(), refused=True, chunk_ids=ids, searches=searches, deep=deep
+        )
+    return Answer(
+        text=reply, refused=False, chunk_ids=ids, searches=searches, deep=deep
+    )
 
 
 class OpenRouterCompleter:
@@ -345,8 +381,55 @@ class OpenRouterCompleter:
         self._temperature = temperature
         self._api_key = api_key
         self._base_url = base_url
+        self._env_path = Path(".env")
+        self._env_mtime = self._env_stat()
+
+    def _env_stat(self) -> float | None:
+        try:
+            return self._env_path.stat().st_mtime
+        except OSError:
+            return None
+
+    def _reload_key_if_changed(self) -> bool:
+        """Pick up a rotated API key without a restart.
+
+        Settings are otherwise read once at startup, so replacing a dead key in
+        .env did nothing until the process was bounced — a trap hit twice in
+        four days. Only the credential group is reloaded: channels need
+        re-subscription, the dashboard port is already bound, and changing the
+        embedding model would invalidate every stored vector.
+        """
+        mtime = self._env_stat()
+        if mtime is None or mtime == self._env_mtime:
+            return False
+        self._env_mtime = mtime
+
+        from slackqa.config import Settings
+
+        try:
+            fresh = Settings()  # bypasses the settings cache
+        except Exception:
+            return False
+        if fresh.openrouter_api_key == self._api_key and fresh.model == self._model:
+            return False
+
+        from openai import AsyncOpenAI
+
+        self._api_key = fresh.openrouter_api_key
+        self._model = fresh.model
+        self._client = AsyncOpenAI(
+            api_key=self._api_key,
+            base_url=self._base_url,
+            default_headers={
+                "HTTP-Referer": "https://github.com/local/slackqa",
+                "X-Title": "slackqa",
+            },
+        )
+        logger.info("Reloaded model credentials from .env (model=%s)", self._model)
+        return True
 
     async def check_credentials(self) -> None:
+        self._reload_key_if_changed()
         """Fail loudly at startup if the key is dead.
 
         Without this the first symptom is a 401 raised per question, twenty
@@ -370,6 +453,7 @@ class OpenRouterCompleter:
             )
 
     async def complete(self, system: str, user: str) -> str:
+        self._reload_key_if_changed()
         resp = await self._client.chat.completions.create(
             model=self._model,
             max_tokens=self._max_tokens,
