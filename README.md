@@ -5,7 +5,8 @@ with permalink citations — and says so when it doesn't know.
 
 @mention it in a channel and it replies in a thread, grounded in that channel's
 history. That's the whole product. Design decisions and their rationale are in
-[SPEC.md](SPEC.md).
+[SPEC.md](SPEC.md). Its history, pending work and standing
+decisions are in [LOG.md](LOG.md).
 
 ```
 you    @slackqa what did we decide about the orders table?

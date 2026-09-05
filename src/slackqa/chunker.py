@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from slackqa.store import Chunk, Message
@@ -63,11 +64,34 @@ def _make_chunk(
     )
 
 
+def enrich_with_papers(text: str, papers: Mapping[str, str]) -> str:
+    """Append what each linked paper is about.
+
+    A link-sharing channel indexes as a wall of URLs: the chunk holds
+    "nature.com/articles/s41567-023-02294-y" while every word someone would
+    search for lives in the paper behind it. Folding in the resolved title and
+    abstract is what makes such a channel searchable at all.
+    """
+    if not papers:
+        return text
+    from slackqa.literature import extract
+
+    blurbs: list[str] = []
+    for ref in extract(text):
+        blurb = papers.get(ref.identity)
+        if blurb and blurb not in blurbs:
+            blurbs.append(blurb)
+    if not blurbs:
+        return text
+    return text + "\n\n" + "\n".join(f"[paper] {b}" for b in blurbs)
+
+
 def build_chunks(
     messages: Iterable[Message],
     *,
     gap_seconds: int = DEFAULT_GAP_SECONDS,
     names: Mapping[str, str] | None = None,
+    papers: Mapping[str, str] | None = None,
 ) -> list[Chunk]:
     """Build retrieval chunks from a channel's messages.
 
@@ -103,6 +127,11 @@ def build_chunks(
         window.append(m)
     if window:
         chunks.append(_make_chunk(window, "window", names))
+
+    if papers:
+        chunks = [
+            replace(c, text=enrich_with_papers(c.text, papers)) for c in chunks
+        ]
 
     chunks.sort(key=lambda c: (c.start_ts, c.anchor_ts))
     return chunks

@@ -47,6 +47,7 @@ _URL_RE = re.compile(r"https?://[^\s<>|)\]]+")
 _SLACK_LINK_RE = re.compile(r"<(https?://[^>|]+)(?:\|[^>]*)?>")
 # Campaign parameters differ between two shares of the same page.
 _TRACKING_RE = re.compile(r"[?&](utm_[^=]+|fbclid|gclid|mc_cid|mc_eid)=[^&]*", re.I)
+_MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)>")
 
 
 def normalise_url(url: str) -> str:
@@ -75,6 +76,17 @@ _DOI_FROM_URL = [
 _DOI_SUFFIXES = ("/meta", "/full", "/pdf", "/abstract", "/html", "/epdf", "/citations")
 
 
+def strip_markup(text: str) -> str:
+    """Remove the markup registries embed in titles and abstracts.
+
+    Crossref returns MathML inside titles — a subscripted formula arrives as
+    fifty tags around one character. Indexed raw it costs tokens, feeds junk
+    terms to BM25, and looks like corruption if the model quotes it.
+    """
+    text = re.sub(r"<[^>]+>", "", text or "")
+    return " ".join(html.unescape(text).split())
+
+
 def clean_doi(doi: str) -> str:
     doi = doi.split("?")[0].split("#")[0]
     doi = doi.strip().rstrip(".,;)>\u2026")
@@ -93,6 +105,10 @@ class Reference:
     arxiv_id: str | None = None
     url: str | None = None
     source_ts: str = ""
+    # Slack user ids @-mentioned in the same message. Someone naming a
+    # colleague beside a link is asking them to read it, which is worth keeping
+    # once the paper reaches the library.
+    mentions: list[str] = field(default_factory=list)
 
     @property
     def identity(self) -> str:
@@ -112,6 +128,20 @@ class Paper:
     abstract: str = ""
     container: str = ""
     item_type: str = "journalArticle"
+
+    def to_json(self) -> str:
+        import json
+
+        return json.dumps(self.__dict__)
+
+    @classmethod
+    def from_json(cls, blob: str) -> Paper | None:
+        import json
+
+        try:
+            return cls(**json.loads(blob))
+        except Exception:
+            return None
 
     def to_zotero(self) -> dict[str, Any]:
         item: dict[str, Any] = {
@@ -137,8 +167,13 @@ class Paper:
 
 
 def extract(text: str, source_ts: str = "") -> list[Reference]:
-    """References in one message, de-duplicated, DOI preferred over URL."""
+    """References in one message, de-duplicated, DOI preferred over URL.
+
+    Every reference in a message inherits that message's @-mentions: someone
+    posting three links and tagging a colleague means all three, not the last.
+    """
     text = html.unescape(text or "")
+    mentions = sorted(_MENTION_RE.findall(text))
     # Take the target of every Slack-formatted link, then drop the whole
     # construct so its display text cannot be re-matched as a second URL.
     linked = [normalise_url(u) for u in _SLACK_LINK_RE.findall(text)]
@@ -150,6 +185,7 @@ def extract(text: str, source_ts: str = "") -> list[Reference]:
     def add(ref: Reference) -> None:
         if ref.identity and ref.identity.lower() not in seen:
             seen.add(ref.identity.lower())
+            ref.mentions = list(mentions)
             refs.append(ref)
 
     for m in _ARXIV_RE.finditer(text):
@@ -216,12 +252,12 @@ async def _from_crossref(session: aiohttp.ClientSession, doi: str) -> Paper | No
     ]
     parts = (msg.get("issued", {}).get("date-parts") or [[]])[0]
     return Paper(
-        title=" ".join(msg.get("title") or ["(untitled)"]),
+        title=strip_markup(" ".join(msg.get("title") or ["(untitled)"])),
         authors=authors,
         date="-".join(str(p) for p in parts) if parts else "",
         doi=doi,
         url=msg.get("URL", f"https://doi.org/{doi}"),
-        abstract=re.sub(r"<[^>]+>", "", msg.get("abstract") or ""),
+        abstract=strip_markup(msg.get("abstract") or ""),
         container=" ".join(msg.get("container-title") or []),
         item_type="journalArticle",
     )
@@ -247,7 +283,7 @@ async def _from_arxiv(session: aiohttp.ClientSession, arxiv_id: str) -> Paper | 
 
     def tag(name: str) -> str:
         m = re.search(rf"<{name}>(.*?)</{name}>", entry, re.DOTALL)
-        return " ".join(m.group(1).split()) if m else ""
+        return strip_markup(m.group(1)) if m else ""
 
     title = tag("title")
     if not title:

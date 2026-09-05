@@ -7,12 +7,16 @@ instantiating at import time makes every module unimportable without a populated
 
 from __future__ import annotations
 
+import logging
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -36,6 +40,24 @@ class Settings(BaseSettings):
     openrouter_api_key: str
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     model: str = "anthropic/claude-sonnet-5"
+
+    # Local cluster, tried first when configured. Open WebUI speaks the
+    # OpenAI-compatible protocol, so the base URL is its /api path.
+    local_api_base: str = ""
+    local_api_key: str = ""
+    local_model: str = ""
+    # Generation on local hardware is slower than a hosted frontier model, but
+    # an unbounded wait is worse than a fallback: the question is sitting in
+    # Slack while nobody knows anything is wrong.
+    local_timeout: float = 90.0
+    # Refuse to fall back to OpenRouter. Turns "usually local" into a hard
+    # guarantee that channel content never leaves the lab, at the cost of no
+    # answers when the cluster is down.
+    local_only: bool = False
+
+    @property
+    def local_enabled(self) -> bool:
+        return bool(self.local_api_base and self.local_model)
     max_answer_tokens: int = 2048
     # Deterministic by default: the same question on an unchanged index should
     # give the same answer. Retrieval is already deterministic, so sampling was
@@ -69,6 +91,11 @@ class Settings(BaseSettings):
     skill_path: Path = Path("skills/answering/SKILL.md")
 
     evals_path: Path = Path("evals/retrieval.yaml")
+
+    # Entity profiles. Markdown so agents edit the files directly and humans
+    # can read a diff; the dashboard is a view over the same files.
+    profiles_dir: Path = Path("profiles")
+    profile_active_months: int = 6
 
     # Zotero. Writes land in a library the whole lab shares, so the write path
     # stays off until switched on deliberately.
@@ -128,3 +155,57 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()  # type: ignore[call-arg]
+
+
+# Settings whose value would identify a credential if logged.
+_SECRET_HINTS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+
+
+def shadowed_settings(env_path: Path | str = ".env") -> list[tuple[str, str, str]]:
+    """Settings where an exported environment variable disagrees with .env.
+
+    Environment variables outrank the file, so a stale export silently wins and
+    editing .env does nothing. Worse, it defeats the API-key hot reload: a fresh
+    key in the file is read and then overridden by the old exported one, which
+    looks exactly like a key that was never updated.
+
+    Sourcing .env into a shell is the usual cause — it copies every value into
+    the environment, where the copy then outranks the original.
+
+    Returns ``(name, file_value, env_value)`` for each disagreement.
+    """
+    from dotenv import dotenv_values
+
+    path = Path(env_path)
+    if not path.exists():
+        return []
+    out: list[tuple[str, str, str]] = []
+    for name, file_value in dotenv_values(path).items():
+        env_value = os.environ.get(name)
+        if file_value is not None and env_value is not None and env_value != file_value:
+            out.append((name, file_value, env_value))
+    return out
+
+
+def warn_about_shadowed_settings(env_path: Path | str = ".env") -> None:
+    """Log a warning naming anything the environment is overriding."""
+    shadowed = shadowed_settings(env_path)
+    if not shadowed:
+        return
+    logger.warning(
+        "%d setting(s) in your shell override %s. The environment wins, so "
+        "editing the file will not change them:",
+        len(shadowed),
+        env_path,
+    )
+    for name, file_value, env_value in shadowed:
+        if any(h in name.upper() for h in _SECRET_HINTS):
+            # Naming the variable is enough to act on; printing a credential
+            # into the log is not worth the extra clarity.
+            logger.warning("  %s differs from the file (value not shown)", name)
+        else:
+            logger.warning("  %s=%s   (file says %s)", name, env_value, file_value)
+    logger.warning(
+        "  Fix with: unset %s   — or start from a new shell.",
+        " ".join(n for n, _, _ in shadowed),
+    )

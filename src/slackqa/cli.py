@@ -9,7 +9,7 @@ import sys
 from datetime import date
 
 from slackqa.answerer import CredentialsError
-from slackqa.config import get_settings
+from slackqa.config import get_settings, warn_about_shadowed_settings
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -124,6 +124,88 @@ async def _glossary(action: str, args) -> int:
     return 1
 
 
+async def _profile(action: str, args) -> int:
+    from slackqa.profiles import INSTRUMENT, PERSON, Profiles
+    from slackqa.store import Store
+
+    settings = get_settings()
+    profiles = Profiles(settings.profiles_dir)
+
+    if action == "list":
+        rows = profiles.all()
+        if not rows:
+            print("No profiles yet. Run 'slackqa profile build'.")
+            return 1
+        for p in sorted(rows, key=lambda x: (x.kind, x.name.lower())):
+            mark = "OK" if p.endorsed else "??"
+            state = "" if p.active() else "  (dormant)"
+            last = p.last_active() or "-"
+            print(f"{mark} {p.kind[:4]:<5} {p.name:<18} last {last:<8}{state}")
+            if p.abstract:
+                print(f"       {p.abstract.splitlines()[0][:88]}")
+        return 0
+
+    if action == "show":
+        p = profiles.load(args.name, INSTRUMENT) or profiles.load(args.name, PERSON)
+        if not p:
+            print(f"No profile for {args.name!r}")
+            return 1
+        print(profiles.path_for(p.name, p.kind).read_text())
+        return 0
+
+    if action == "build":
+        from slack_sdk.web.async_client import AsyncWebClient
+
+        from slackqa.app import build as build_bot
+        from slackqa.profiling import build_profile
+        from slackqa.seeds import INSTRUMENT_SEEDS
+
+        bot = await build_bot(settings)
+        store: Store = bot.store
+        slack = AsyncWebClient(token=settings.slack_bot_token)
+        names = await slack.conversations_list(limit=200)
+        by_id = {c["id"]: c["name"] for c in names.get("channels", [])}
+
+        if args.kind in ("instrument", "all"):
+            for ch in settings.channels:
+                label = by_id.get(ch, ch)
+                seed = INSTRUMENT_SEEDS.get(label, {})
+                if not seed and not args.all_channels:
+                    # Only channels that name an instrument get an instrument
+                    # profile; #coolpapers is a channel, not a microscope.
+                    print(f"skipping {label} — not a known instrument")
+                    continue
+                chunks = await store.chunks_for_channel(ch)
+                print(f"instrument {label}: {len(chunks)} chunks")
+                await build_profile(
+                    store, bot.completer, profiles, name=label, kind=INSTRUMENT,
+                    channel=ch, chunks=chunks,
+                    seed_abstract=seed.get("abstract", ""),
+                    source=seed.get("source", ""),
+                    max_periods=args.limit,
+                )
+
+        if args.kind in ("person", "all"):
+            people = await store.people_with_activity()
+            if args.name:
+                people = [p for p in people if p["display_name"] == args.name]
+            for row in people[: args.people or len(people)]:
+                chunks = await store.chunks_for_person(row["user_id"], row["display_name"])
+                if len(chunks) < args.min_chunks:
+                    continue
+                print(f"person {row['display_name']}: {len(chunks)} chunks")
+                await build_profile(
+                    store, bot.completer, profiles, name=row["display_name"],
+                    kind=PERSON, slack_id=row["user_id"], chunks=chunks,
+                    max_periods=args.limit,
+                )
+
+        await store.close()
+        return 0
+
+    return 1
+
+
 async def _lit(action: str, args) -> int:
     from slackqa.store import Store
 
@@ -146,10 +228,39 @@ async def _lit(action: str, args) -> int:
         await store.close()
         return 0
 
+    if action == "resolve":
+        from slack_sdk.web.async_client import AsyncWebClient
+
+        from slackqa.embeddings import FastEmbedEmbedder
+        from slackqa.ingest import reindex_channel
+        from slackqa.librarian import resolve_metadata
+        from slackqa.names import NameResolver
+
+        slack = AsyncWebClient(token=settings.slack_bot_token)
+        for channel_id in (settings.literature_channels or settings.channels):
+            if args.retry_failed:
+                dropped = await store.forget_unresolved(channel_id)
+                print(f"{channel_id}: retrying {dropped} previously unresolved")
+            got, bad = await resolve_metadata(
+                store, slack, channel_id,
+                unpaywall_email=settings.unpaywall_email, limit=args.limit,
+            )
+            print(f"{channel_id}: resolved {got}, failed {bad}")
+            if got:
+                names = await NameResolver(store, slack).for_channel(channel_id)
+                n = await reindex_channel(
+                    store, FastEmbedEmbedder(settings.embed_model), channel_id,
+                    names=names, gap_seconds=settings.chunk_gap_seconds,
+                )
+                print(f"  reindexed {n} chunks with paper titles and abstracts")
+        await store.close()
+        return 0
+
     if action == "scan":
         from slack_sdk.web.async_client import AsyncWebClient
 
         from slackqa.librarian import format_report, scan_channel
+        from slackqa.names import NameResolver
         from slackqa.zotero import Zotero
 
         if not settings.literature_channels:
@@ -179,6 +290,7 @@ async def _lit(action: str, args) -> int:
                 store, slack, zot, channel_id, name,
                 unpaywall_email=settings.unpaywall_email,
                 limit=limit, dry_run=dry, oldest_first=args.oldest_first,
+                names=NameResolver(store, slack), fetch_pdfs=not args.no_pdf,
             )
             print(format_report(outcomes, name + (" (dry run)" if dry else "")))
         await store.close()
@@ -282,14 +394,38 @@ def main() -> None:
     sub.add_parser("status", help="listener / index / API key indicators")
     sub.add_parser("eval", help="retrieval recall against evals/retrieval.yaml")
 
+    pr = sub.add_parser("profile", help="entity profiles for people and instruments")
+    psub = pr.add_subparsers(dest="action")
+    psub.add_parser("list", help="all profiles, newest activity first")
+    ps = psub.add_parser("show", help="print one profile")
+    ps.add_argument("name")
+    pb = psub.add_parser("build", help="create or extend profiles from the index")
+    pb.add_argument("--kind", choices=["person", "instrument", "all"], default="all")
+    pb.add_argument("--name", help="build just this person")
+    pb.add_argument("--limit", type=int, help="max periods to generate per profile")
+    pb.add_argument("--people", type=int, help="max people this run")
+    pb.add_argument("--min-chunks", type=int, default=20,
+                    help="skip people with less material than this")
+    pb.add_argument("--all-channels", action="store_true",
+                    help="profile every channel, not just known instruments")
+
     lit = sub.add_parser("lit", help="file shared papers into Zotero")
     lsub = lit.add_subparsers(dest="action")
     ls = lsub.add_parser("scan", help="scan whitelisted channels for papers")
     ls.add_argument("--limit", type=int, help="max new papers this run")
     ls.add_argument("--dry-run", action="store_true", help="resolve but write nothing")
+    ls.add_argument("--no-pdf", action="store_true",
+                    help="file metadata only — Zotero group storage is limited")
     ls.add_argument("--oldest-first", action="store_true",
                     help="work forward from the oldest papers instead of the newest")
     lsub.add_parser("pending", help="papers needing a human to fetch the PDF")
+    lr = lsub.add_parser(
+        "resolve",
+        help="fetch titles/abstracts for linked papers so the channel is searchable",
+    )
+    lr.add_argument("--limit", type=int, help="max references to resolve this run")
+    lr.add_argument("--retry-failed", action="store_true",
+                    help="re-attempt references that previously failed to resolve")
 
     ask = sub.add_parser("ask", help="ask one question from the terminal")
     ask.add_argument("channel")
@@ -313,6 +449,7 @@ def main() -> None:
 
     args = parser.parse_args()
     _setup_logging(args.verbose)
+    warn_about_shadowed_settings()
 
     command = args.command or "run"
     try:
@@ -337,6 +474,12 @@ def _dispatch(command: str, args, parser) -> int:
         code = asyncio.run(_status())
     elif command == "eval":
         code = asyncio.run(_eval())
+    elif command == "profile":
+        if not getattr(args, "action", None):
+            print("Usage: slackqa profile {list,show,build}")
+            code = 1
+        else:
+            code = asyncio.run(_profile(args.action, args))
     elif command == "lit":
         if not getattr(args, "action", None):
             print("Usage: slackqa lit {scan,pending}")

@@ -105,6 +105,7 @@ async def reindex_window(
     *,
     names: Mapping[str, str] | None = None,
     gap_seconds: int = DEFAULT_GAP_SECONDS,
+    papers: Mapping[str, str] | None = None,
 ) -> int:
     """Rebuild chunks and embeddings covering ``[lo, hi]``.
 
@@ -130,7 +131,9 @@ async def reindex_window(
 
     await store.delete_chunks_in_range(channel_id, lo, hi)
 
-    chunks = build_chunks(messages, gap_seconds=gap_seconds, names=names)
+    chunks = build_chunks(
+        messages, gap_seconds=gap_seconds, names=names, papers=papers
+    )
     if not chunks:
         return 0
 
@@ -149,7 +152,12 @@ async def reindex_channel(
 ) -> int:
     messages = await store.messages_in_range(channel_id, 0, float("inf"))
     await store.delete_chunks_in_range(channel_id, 0, float("inf"))
-    chunks = build_chunks(messages, gap_seconds=gap_seconds, names=names)
+    papers = await store.resolved_papers(channel_id)
+    if papers:
+        logger.info("Enriching %s with %d resolved papers", channel_id, len(papers))
+    chunks = build_chunks(
+        messages, gap_seconds=gap_seconds, names=names, papers=papers
+    )
     if not chunks:
         return 0
     vecs = embedder.embed_documents([c.text for c in chunks])

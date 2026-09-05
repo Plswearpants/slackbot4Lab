@@ -133,3 +133,108 @@ def test_excludes_empty_text():
 def test_mention_helpers():
     assert mentioned_users("<@U123> and <@W456> hi") == {"U123", "W456"}
     assert strip_mentions("<@U123> what is the plan?") == "what is the plan?"
+
+
+# --------------------------------------------------- mentions inside a question
+
+NAMES = {"U0BOT": "LAIRbot", "U8JQ4HFV3": "Markus", "USQCN4F9R": "Sarah"}
+
+
+def test_mention_becomes_a_name_not_a_hole():
+    """Stripping every mention erased the subject of the question: "what is
+    @Markus working on" became "what is working on" before retrieval ran."""
+    from slackqa.filters import name_mentions
+
+    q = "<@U0BOT> what is <@U8JQ4HFV3> working on these days?"
+    assert name_mentions(q, NAMES, drop={"U0BOT"}) == (
+        "what is Markus working on these days?"
+    )
+
+
+def test_several_people_in_one_question():
+    from slackqa.filters import name_mentions
+
+    q = "<@U0BOT> did <@U8JQ4HFV3> and <@USQCN4F9R> agree?"
+    assert name_mentions(q, NAMES, drop={"U0BOT"}) == "did Markus and Sarah agree?"
+
+
+def test_unknown_id_falls_back_to_the_id():
+    from slackqa.filters import name_mentions
+
+    out = name_mentions("<@U0BOT> ask <@UNKNOWN1>", NAMES, drop={"U0BOT"})
+    assert out == "ask UNKNOWN1" or "UNKNOWN1" in out
+
+
+def test_question_without_mentions_is_untouched():
+    from slackqa.filters import name_mentions
+
+    assert name_mentions("what is the status?", NAMES) == "what is the status?"
+
+
+def test_naming_a_person_makes_them_searchable():
+    # Chunks render as "Markus: ...", so substituting the name is what lets
+    # retrieval find that person's messages at all.
+    from slackqa.filters import name_mentions
+    from slackqa.retrieval import fts_query
+
+    q = name_mentions("<@U0BOT> what did <@U8JQ4HFV3> say", NAMES, drop={"U0BOT"})
+    assert '"Markus"' in fts_query(q)
+
+
+# ------------------------------------------- paper metadata folded into chunks
+
+PAPERS = {
+    "10.1038/s41567-023-02294-y": "Superconductivity in a monolayer — We report "
+                                  "an unconventional pairing state.",
+    "arXiv:2412.02813": "Quasiparticle interference imaging",
+}
+
+
+def test_bare_link_gains_the_papers_words():
+    """A link-sharing channel indexes as a wall of URLs: the chunk holds the
+    address while every searchable word lives in the paper behind it."""
+    from slackqa.chunker import enrich_with_papers
+
+    text = "[2023-12-12 17:34] Markus: <https://doi.org/10.1038/s41567-023-02294-y>"
+    out = enrich_with_papers(text, PAPERS)
+    assert "Superconductivity in a monolayer" in out
+    assert "unconventional pairing" in out
+    assert text in out  # the original conversation survives
+
+
+def test_unresolved_links_leave_the_text_alone():
+    from slackqa.chunker import enrich_with_papers
+
+    text = "look at https://example.org/unknown"
+    assert enrich_with_papers(text, PAPERS) == text
+
+
+def test_no_papers_is_a_no_op():
+    from slackqa.chunker import enrich_with_papers
+
+    text = "10.1038/s41567-023-02294-y"
+    assert enrich_with_papers(text, {}) == text
+
+
+def test_the_same_paper_twice_is_appended_once():
+    from slackqa.chunker import enrich_with_papers
+
+    text = ("10.1038/s41567-023-02294-y and again "
+            "https://doi.org/10.1038/s41567-023-02294-y")
+    assert enrich_with_papers(text, PAPERS).count("Superconductivity in a monolayer") == 1
+
+
+def test_build_chunks_enriches():
+    msgs = [msg(100, "https://doi.org/10.1038/s41567-023-02294-y")]
+    out = build_chunks(msgs, papers=PAPERS)
+    assert "Superconductivity in a monolayer" in out[0].text
+
+
+def test_channel_reference_becomes_a_name():
+    # "<#CLXDY4AK1>" reached a question verbatim and matched nothing.
+    from slackqa.filters import name_mentions
+
+    assert name_mentions("coaxes for <#CLXDY4AK1|4probe>", {}) == "coaxes for #4probe"
+    assert name_mentions("coaxes for <#CLXDY4AK1>", {}, channels={"CLXDY4AK1": "4probe"}) == (
+        "coaxes for #4probe"
+    )

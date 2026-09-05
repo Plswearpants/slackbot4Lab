@@ -207,3 +207,68 @@ def test_query_string_is_not_part_of_the_doi():
     assert clean_doi("10.1021/acsnano.1c05986?ref=article_openPDF") == (
         "10.1021/acsnano.1c05986"
     )
+
+
+# ----------------------------------------------------- reader tags from @mentions
+
+
+def test_mentions_are_captured_with_the_reference():
+    text = "square net superconductor <@USQCN4F9R> <@U8JQ4HFV3> https://arxiv.org/abs/2412.02813"
+    refs = extract(text)
+    assert len(refs) == 1
+    assert refs[0].mentions == ["U8JQ4HFV3", "USQCN4F9R"]
+
+
+def test_every_reference_in_a_message_inherits_its_mentions():
+    # Someone posting two links and tagging a colleague means both papers.
+    text = "<@U01513DKXRQ> these two: 10.1103/PhysRevB.108.094505 arXiv:2412.02813"
+    refs = extract(text)
+    assert len(refs) == 2
+    assert all(r.mentions == ["U01513DKXRQ"] for r in refs)
+
+
+def test_no_mentions_leaves_the_list_empty():
+    assert extract("just a link https://arxiv.org/abs/2412.02813")[0].mentions == []
+
+
+def test_reader_tag_uses_a_grouping_prefix():
+    from slackqa.zotero import READER_TAG_PREFIX, reader_tag
+
+    # Zotero's tag selector sorts alphabetically, so a shared prefix keeps
+    # every reader tag together instead of scattered among subject tags.
+    assert reader_tag("Markus") == "for:Markus"
+    assert reader_tag("  Sarah  ").startswith(READER_TAG_PREFIX)
+
+
+def test_mathml_is_stripped_from_titles():
+    """Crossref embeds MathML in titles: a subscripted WP2 arrives as fifty
+    tags around one character, which indexes as junk and reads as corruption."""
+    from slackqa.literature import strip_markup
+
+    raw = ("Observation of Weyl Nodes in Robust Type-II Weyl Semimetal "
+           '<mml:math xmlns:mml="http://www.w3.org/1998/Math/MathML" '
+           "display=\"inline\"><mml:mrow><mml:msub><mml:mrow><mml:mi>WP</mml:mi>"
+           "</mml:mrow><mml:mrow><mml:mn>2</mml:mn></mml:mrow></mml:msub>"
+           "</mml:mrow></mml:math>")
+    out = strip_markup(raw)
+    assert "mml:" not in out and "<" not in out
+    # Adjacent tags carry no whitespace, so the subscript rejoins correctly:
+    # the formula comes out as WP2, which is what it should read as.
+    assert out == "Observation of Weyl Nodes in Robust Type-II Weyl Semimetal WP2"
+
+
+def test_strip_markup_collapses_whitespace_and_entities():
+    from slackqa.literature import strip_markup
+
+    assert strip_markup("a  &amp;  b\n\nc") == "a & b c"
+
+
+async def test_resolved_but_unfiled_papers_are_not_treated_as_done(store):
+    """Resolving metadata records a row too. Treating any recorded reference as
+    handled made the filing pass skip six hundred papers it had never filed."""
+    await store.record_reference("10.1/x", "C1", "indexed", title="T")
+    assert await store.seen_reference("10.1/x") is True
+    assert await store.filed_reference("10.1/x") is False
+
+    await store.record_reference("10.1/x", "C1", "added", title="T", zotero_key="ABC")
+    assert await store.filed_reference("10.1/x") is True

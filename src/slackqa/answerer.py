@@ -15,15 +15,19 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from slackqa.profiles import Profile
 from slackqa.retrieval import Hit, Retriever
 
 logger = logging.getLogger(__name__)
+
+MAX_PROFILES = 3
 
 NO_ANSWER = "NO_ANSWER"
 
@@ -60,6 +64,15 @@ rather than defending the earlier answer.
 the question. They are not channel evidence, so do not cite them. If a \
 definition is marked UNENDORSED, say which term you leaned on and that its \
 definition is unconfirmed.
+
+9. Profiles are background on a person or an instrument, assembled from this \
+channel's own history. They tell you who or what the question is about; they \
+are not excerpts and never become claims. Rule 1 still holds: anything you \
+assert must be supported by an excerpt, and a profile is not one. Never cite a \
+profile. Where several profiles are offered as CANDIDATES for one ambiguous \
+name, at most one of them is meant — choose the one the excerpts support. If \
+the excerpts do not distinguish them, say the name is ambiguous and ask which \
+person is meant. Do not blend two candidates into one person, and do not guess.
 
 If the excerpts look like they missed the point of the question and a different \
 search would plainly do better, reply with exactly one line:
@@ -140,6 +153,49 @@ def render_thread(turns: Sequence[Turn], max_chars: int = 4000) -> str:
     return "\n".join(reversed(out))
 
 
+def profile_block(
+    certain: Sequence[Profile] = (),
+    ambiguous: Sequence[Sequence[Profile]] = (),
+    *,
+    recent: int = 4,
+) -> str:
+    """Render profiles for the prompt: what is known, and what is ambiguous.
+
+    Candidate groups are labelled explicitly and kept to abstracts. Unlabelled,
+    a model reads three profiles for one name as three relevant people and
+    blends them into a composite who does not exist.
+    """
+
+    def one(p: Profile, *, full: bool) -> str:
+        out = [f"### {p.name} ({p.kind})"]
+        if p.abstract:
+            out.append(p.abstract.strip())
+        if full:
+            if p.systems:
+                out.append("Sample systems: " + ", ".join(p.systems))
+            for e in p.timeline[:recent]:
+                out.append(f"{e.period}: {e.text}")
+        return "\n".join(out)
+
+    if not certain and not ambiguous:
+        return ""
+
+    parts = [
+        "Profiles — background only. Use them to understand who or what is "
+        "meant. They are not evidence and must never be cited."
+    ]
+    parts += [one(p, full=True) for p in certain]
+    for group in ambiguous:
+        names = ", ".join(p.name for p in group)
+        parts.append(
+            f"CANDIDATES — the question names someone whose first name could "
+            f"mean any of: {names}. At most one is meant. Decide from the "
+            f"excerpts; if they do not settle it, ask which is meant."
+        )
+        parts += [one(p, full=False) for p in group]
+    return "\n\n".join(parts) + "\n"
+
+
 def build_user_prompt(
     question: str,
     hits: Sequence[Hit],
@@ -148,11 +204,22 @@ def build_user_prompt(
     *,
     thread: Sequence[Turn] | None = None,
     glossary_block: str = "",
+    roster: Sequence[str] = (),
+    profiles_block: str = "",
 ) -> str:
     sections: list[str] = []
 
+    if roster:
+        sections.append(
+            "People in this channel: " + ", ".join(sorted(roster)) + ".\n"
+            "A name in the question refers to one of them."
+        )
+
     if glossary_block:
         sections.append(glossary_block)
+
+    if profiles_block:
+        sections.append(profiles_block)
 
     if thread:
         sections.append("Conversation so far (this thread):\n" + render_thread(thread))
@@ -219,6 +286,7 @@ class Answerer:
         glossary: object | None = None,
         skill: object | None = None,
         store: object | None = None,
+        profiles: object | None = None,
     ) -> None:
         self._retriever = retriever
         self._completer = completer
@@ -229,6 +297,7 @@ class Answerer:
         self._glossary = glossary
         self._skill = skill
         self._store = store
+        self._profiles = profiles
 
     def _search_query(
         self,
@@ -259,6 +328,7 @@ class Answerer:
         *,
         thread: Sequence[Turn] | None = None,
         deep: bool = False,
+        roster: Sequence[str] = (),
     ) -> Answer:
         from slackqa.expansion import expand, strip_trigger, wants_expansion
 
@@ -285,7 +355,7 @@ class Answerer:
                 text=_refusal_text(), refused=True, chunk_ids=[], searches=1, deep=deep
             )
 
-        reply = await self._ask(channel_id, question, hits, thread, gloss)
+        reply = await self._ask(channel_id, question, hits, thread, gloss, roster)
 
         match = _SEARCH_RE.search(reply)
         if match:
@@ -295,7 +365,7 @@ class Answerer:
             if hits2:
                 hits = hits2
             # Second and final pass; any further SEARCH line is ignored below.
-            reply = await self._ask(channel_id, question, hits, thread, gloss)
+            reply = await self._ask(channel_id, question, hits, thread, gloss, roster)
             reply = _SEARCH_RE.sub("", reply).strip()
             return _finalize(reply, hits, searches=2, deep=deep)
 
@@ -315,6 +385,7 @@ class Answerer:
         hits: Sequence[Hit],
         thread: Sequence[Turn] | None = None,
         glossary_block: str = "",
+        roster: Sequence[str] = (),
     ) -> str:
         user = build_user_prompt(
             question,
@@ -323,8 +394,34 @@ class Answerer:
             channel_id,
             thread=thread,
             glossary_block=glossary_block,
+            roster=roster,
+            profiles_block=self._profiles_block(question, hits, roster),
         )
         return (await self._completer.complete(self._system(), user)).strip()
+
+    def _profiles_block(
+        self, question: str, hits: Sequence[Hit], roster: Sequence[str]
+    ) -> str:
+        """Profiles for whoever the question names.
+
+        The retrieved excerpts are passed as evidence, so a first name shared by
+        several people usually resolves here — only what the channel itself
+        cannot settle is handed to the model as a candidate list.
+        """
+        if self._profiles is None:
+            return ""
+        try:
+            certain, ambiguous = self._profiles.candidates(
+                question,
+                evidence="\n".join(h.text for h in hits),
+                roster=roster,
+            )
+        except Exception:
+            logger.warning("Profile lookup failed; answering without it", exc_info=True)
+            return ""
+        # A question naming four people should not crowd out the evidence the
+        # answer has to cite.
+        return profile_block(certain[:MAX_PROFILES], ambiguous[:MAX_PROFILES])
 
 
 def _refusal_text() -> str:
@@ -347,7 +444,173 @@ def _finalize(
     )
 
 
+class LocalCompleter:
+    """Completions from the lab's own cluster, via its OpenAI-compatible API.
+
+    Open WebUI exposes the same protocol as OpenRouter, so this differs only in
+    what it points at and in having no vendor-specific key endpoint to check —
+    a model listing serves that purpose.
+    """
+
+    name = "local"
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        base_url: str,
+        max_tokens: int = 1024,
+        temperature: float = 0.0,
+        timeout: float = 90.0,
+    ) -> None:
+        from openai import AsyncOpenAI
+
+        self._base_url = str(base_url).rstrip("/")
+        self._client = AsyncOpenAI(
+            api_key=api_key or "unused", base_url=self._base_url, timeout=timeout,
+            max_retries=0,  # the fallback is the retry
+        )
+        self._model = model
+        self._max_tokens = max_tokens
+        self._temperature = temperature
+        self._api_key = api_key
+
+    async def check_credentials(self) -> None:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=15) as http:
+            resp = await http.get(
+                f"{self._base_url}/models",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+            )
+        if resp.status_code in (401, 403):
+            raise CredentialsError(
+                f"The local cluster rejected the API key ({resp.status_code}). "
+                "Check LOCAL_API_KEY in .env against the key in Open WebUI."
+            )
+        if resp.status_code >= 400:
+            raise CredentialsError(
+                f"Local cluster check failed ({resp.status_code}): {resp.text[:200]}"
+            )
+
+    async def complete(self, system: str, user: str) -> str:
+        resp = await self._client.chat.completions.create(
+            model=self._model,
+            max_tokens=self._max_tokens,
+            temperature=self._temperature,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        if not resp.choices:
+            raise RuntimeError("local cluster returned no choices")
+        return resp.choices[0].message.content or ""
+
+
+class FallbackCompleter:
+    """Try the local cluster; fall back to a hosted model when it cannot answer.
+
+    A *failure* is the cluster being unreachable, timing out, erroring, or
+    returning nothing. A refusal is not a failure — if the model correctly says
+    the channel does not support an answer, that is the answer, and asking a
+    second model until one is willing to speak would defeat the point.
+
+    Once the cluster has failed repeatedly there is no sense paying its timeout
+    on every question, so it is skipped for a cooling-off period and then tried
+    again.
+    """
+
+    def __init__(
+        self,
+        primary: Completer,
+        fallback: Completer | None,
+        *,
+        failures_before_pause: int = 3,
+        pause_seconds: float = 120.0,
+    ) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._limit = failures_before_pause
+        self._pause = pause_seconds
+        self._failures = 0
+        self._skip_until = 0.0
+        self.last_used = ""
+        # Counted, not just remembered. With the cluster behind a VPN a
+        # fallback is a daily event rather than an outage, and "what answered
+        # the last question" hides a morning spent answering off-site.
+        self.answers = 0
+        self.fallbacks = 0
+        self.local_ok: bool | None = None
+
+    @property
+    def paused(self) -> bool:
+        return time.monotonic() < self._skip_until
+
+    async def check_credentials(self) -> None:
+        """Startup check. The local cluster failing is a warning, not fatal —
+        the fallback is what makes that survivable."""
+        try:
+            await self._primary.check_credentials()
+            self.local_ok = True
+        except Exception as exc:
+            self.local_ok = False
+            if self._fallback is None:
+                # LOCAL_ONLY: there is nowhere else to go, so this is a config
+                # problem the user has to see stated, not a traceback.
+                raise CredentialsError(
+                    f"The local cluster is unreachable ({exc}) and LOCAL_ONLY is "
+                    "set, so there is no fallback. Check LOCAL_API_BASE in .env "
+                    "and that you are on the lab network, or unset LOCAL_ONLY to "
+                    "allow OpenRouter."
+                ) from exc
+            logger.warning("Local cluster unavailable at startup: %s", exc)
+        if self._fallback is not None:
+            await self._fallback.check_credentials()
+
+    async def complete(self, system: str, user: str) -> str:
+        if not self.paused:
+            try:
+                text = await self._primary.complete(system, user)
+                if text.strip():
+                    self._failures = 0
+                    self.last_used = "local"
+                    self.local_ok = True
+                    self.answers += 1
+                    return text
+                raise RuntimeError("empty completion")
+            except Exception as exc:
+                self._failures += 1
+                if self._failures >= self._limit:
+                    self._skip_until = time.monotonic() + self._pause
+                    logger.warning(
+                        "Local cluster failed %d times; using the hosted model "
+                        "for %.0fs", self._failures, self._pause,
+                    )
+                self.local_ok = False
+                logger.warning("Local completion failed (%s); falling back", exc)
+                if self._fallback is None:
+                    raise CredentialsError(
+                        f"The local cluster could not answer ({exc}) and "
+                        "LOCAL_ONLY is set, so there is no fallback. Unset "
+                        "LOCAL_ONLY to allow OpenRouter."
+                    ) from exc
+
+        if self._fallback is None:
+            raise CredentialsError(
+                "The local cluster is unavailable and LOCAL_ONLY is set, so no "
+                "answer can be produced. Unset LOCAL_ONLY to fall back to "
+                "OpenRouter."
+            )
+        self.last_used = "openrouter"
+        self.answers += 1
+        self.fallbacks += 1
+        return await self._fallback.complete(system, user)
+
+
 class OpenRouterCompleter:
+    name = "openrouter"
+
     """Completions via OpenRouter's OpenAI-compatible endpoint.
 
     OpenRouter takes the system prompt as the first message rather than as a

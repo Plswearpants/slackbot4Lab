@@ -138,3 +138,28 @@ async def test_query_log(store):
         rows = await cur.fetchall()
     assert len(rows) == 1
     assert rows[0]["question"] == "what did we decide?"
+
+
+async def test_added_columns_are_migrated_into_an_existing_database(tmp_path):
+    """CREATE TABLE IF NOT EXISTS leaves an older table untouched, so a new
+    column has to be added explicitly — otherwise every query naming it fails
+    on exactly the databases that have real data in them."""
+    import aiosqlite
+
+    path = tmp_path / "old.db"
+    # A database created before the column existed.
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            """CREATE TABLE literature (
+                   identity TEXT PRIMARY KEY, channel_id TEXT NOT NULL,
+                   title TEXT NOT NULL DEFAULT '', zotero_key TEXT,
+                   has_pdf INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
+                   detail TEXT NOT NULL DEFAULT '',
+                   source_ts TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL)"""
+        )
+        await db.commit()
+
+    s = await Store.open(path)
+    await s.record_reference("10.1/x", CH, "indexed", title="T", abstract="A")
+    assert await s.resolved_papers(CH) == {"10.1/x": "T — A"}
+    await s.close()

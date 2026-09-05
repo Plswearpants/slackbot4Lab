@@ -19,13 +19,22 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
 from slackqa import dashboard, ingest
-from slackqa.answerer import Answerer, CredentialsError, OpenRouterCompleter, Turn
+from slackqa.answerer import (
+    Answerer,
+    Completer,
+    CredentialsError,
+    FallbackCompleter,
+    LocalCompleter,
+    OpenRouterCompleter,
+    Turn,
+)
 from slackqa.config import Settings
 from slackqa.embeddings import FastEmbedEmbedder
-from slackqa.filters import strip_mentions
+from slackqa.filters import name_mentions, strip_mentions
 from slackqa.glossary import Glossary, SkipList, render_html
 from slackqa.mining import mine, refresh_volatile
 from slackqa.names import NameResolver
+from slackqa.profiles import Profiles
 from slackqa.retrieval import Retriever
 from slackqa.skills import Skill
 from slackqa.store import Store
@@ -59,6 +68,7 @@ class SlackQA:
         self.completer: OpenRouterCompleter | None = None
         self._mining_task: asyncio.Task | None = None
         self._channel_names: dict[str, str] | None = None
+        self._rosters: dict[str, dict[str, str]] = {}
         self.runtime = dashboard.Runtime()
         self.handler: AsyncSocketModeHandler | None = None
         self._dashboard: object | None = None
@@ -79,13 +89,32 @@ class SlackQA:
         auth = await self.app.client.auth_test()
         self.bot_user_id = auth["user_id"]
         self.team_url = auth["url"].rstrip("/")
-        completer = OpenRouterCompleter(
+        hosted = OpenRouterCompleter(
             self.settings.openrouter_api_key,
             self.settings.model,
             self.settings.max_answer_tokens,
             base_url=self.settings.openrouter_base_url,
             temperature=self.settings.temperature,
         )
+        completer: Completer = hosted
+        if self.settings.local_enabled:
+            local = LocalCompleter(
+                self.settings.local_api_key,
+                self.settings.local_model,
+                self.settings.local_api_base,
+                self.settings.max_answer_tokens,
+                temperature=self.settings.temperature,
+                timeout=self.settings.local_timeout,
+            )
+            completer = FallbackCompleter(
+                local, None if self.settings.local_only else hosted
+            )
+            logger.info(
+                "Answering with the local cluster (%s), falling back to %s",
+                self.settings.local_model,
+                "nothing — LOCAL_ONLY is set" if self.settings.local_only
+                else self.settings.model,
+            )
         self.completer = completer
         self.answerer = Answerer(
             self.retriever,
@@ -95,6 +124,7 @@ class SlackQA:
             glossary=self.glossary if self.settings.glossary_enabled else None,
             skill=self.skill,
             store=self.store,
+            profiles=Profiles(self.settings.profiles_dir),
         )
         if self.skill:
             logger.info("Domain skill loaded: %s", self.settings.skill_path)
@@ -223,6 +253,15 @@ class SlackQA:
         await self.write_glossary_html()
         return added
 
+    async def roster(self, channel_id: str) -> dict[str, str]:
+        """Channel membership, cached: it changes far slower than questions."""
+        if channel_id not in self._rosters:
+            self._rosters[channel_id] = await self.names.roster(channel_id)
+            logger.info(
+                "Roster for %s: %d people", channel_id, len(self._rosters[channel_id])
+            )
+        return self._rosters[channel_id]
+
     async def channel_names(self) -> dict[str, str]:
         """Channel id -> name, for display only. Ids stay canonical in the file."""
         if self._channel_names is None:
@@ -249,7 +288,14 @@ class SlackQA:
         self.runtime.note_question()
         channel_id = event["channel"]
         thread_ts = event.get("thread_ts") or event["ts"]
-        question = strip_mentions(event.get("text") or "")
+
+        # Name the people asked about rather than deleting them: stripping every
+        # mention turned "what is @Markus working on" into "what is working on",
+        # erasing the subject before retrieval ever saw it.
+        roster = await self.roster(channel_id)
+        question = name_mentions(
+            event.get("text") or "", roster, drop={self.bot_user_id or ""}
+        )
 
         if not question:
             return
@@ -272,7 +318,10 @@ class SlackQA:
         try:
             turns = await self._thread_turns(channel_id, thread_ts, event["ts"])
             async with self._lock(channel_id):
-                answer = await self.answerer.answer(channel_id, question, thread=turns)
+                answer = await self.answerer.answer(
+                    channel_id, question, thread=turns,
+                    roster=sorted(set(roster.values())),
+                )
             await client.chat_postMessage(
                 channel=channel_id, thread_ts=thread_ts, text=answer.text
             )

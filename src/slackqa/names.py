@@ -72,3 +72,28 @@ class NameResolver:
 
     async def for_channel(self, channel_id: str) -> dict[str, str]:
         return await self.resolve(await self._store.distinct_users(channel_id))
+
+    async def roster(self, channel_id: str) -> dict[str, str]:
+        """Everyone the bot should recognise in this channel.
+
+        Current members plus anyone who has posted, because those differ: a
+        member who never writes is still someone to ask about, and someone who
+        left is still all over the history.
+        """
+        members: set[str] = set()
+        cursor: str | None = None
+        try:
+            while True:
+                kwargs = {"channel": channel_id, "limit": 200}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                resp = await self._client.conversations_members(**kwargs)
+                members.update(resp.get("members") or [])
+                cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+                if not cursor:
+                    break
+        except Exception:
+            logger.warning("Could not list members of %s", channel_id, exc_info=False)
+
+        members.update(await self._store.distinct_users(channel_id))
+        return await self.resolve(members)

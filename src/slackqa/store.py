@@ -67,10 +67,22 @@ CREATE TABLE IF NOT EXISTS users (
     cached_at    REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS profile_audit (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity      TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    action      TEXT NOT NULL,          -- endorse | edit | unendorse
+    actor       TEXT NOT NULL,
+    detail      TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS literature (
     identity    TEXT PRIMARY KEY,       -- DOI, arXiv id, or URL
     channel_id  TEXT NOT NULL,
     title       TEXT NOT NULL DEFAULT '',
+    abstract    TEXT NOT NULL DEFAULT '',
+    metadata    TEXT NOT NULL DEFAULT '',
     zotero_key  TEXT,
     has_pdf     INTEGER NOT NULL DEFAULT 0,
     status      TEXT NOT NULL,          -- added | needs-pdf | unresolved
@@ -131,6 +143,24 @@ def decode_embedding(blob: bytes) -> np.ndarray:
     return np.frombuffer(blob, dtype=np.float32)
 
 
+# Columns added after a database already existed. CREATE TABLE IF NOT EXISTS
+# silently leaves an older table alone, so a new column has to be added
+# explicitly or every query naming it fails on exactly the databases that
+# matter — the ones with real data in them.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("literature", "abstract", "TEXT NOT NULL DEFAULT ''"),
+    ("literature", "metadata", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+async def _migrate(db: aiosqlite.Connection) -> None:
+    for table, column, decl in _ADDED_COLUMNS:
+        async with db.execute(f"PRAGMA table_info({table})") as cur:
+            existing = {r["name"] for r in await cur.fetchall()}
+        if existing and column not in existing:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 class Store:
     def __init__(self, db: aiosqlite.Connection) -> None:
         self._db = db
@@ -144,6 +174,7 @@ class Store:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA foreign_keys=ON")
         await db.executescript(_SCHEMA)
+        await _migrate(db)
         await db.commit()
         return cls(db)
 
@@ -228,6 +259,74 @@ class Store:
             (channel_id,),
         ) as cur:
             return {r["thread_ts"]: r["n"] for r in await cur.fetchall() if r["thread_ts"]}
+
+    async def record_profile_action(
+        self, entity: str, kind: str, action: str, actor: str, detail: str = ""
+    ) -> None:
+        """Append to the audit trail.
+
+        The profile file carries the current endorsement; this carries the
+        history of who touched it, which survives the file being regenerated or
+        overwritten by hand.
+        """
+        import time as _time
+
+        await self._db.execute(
+            """INSERT INTO profile_audit
+               (entity, kind, action, actor, detail, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (entity, kind, action, actor, detail[:2000], _time.time()),
+        )
+        await self._db.commit()
+
+    async def profile_history(
+        self, entity: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM profile_audit"
+        args: tuple[Any, ...] = ()
+        if entity:
+            sql += " WHERE entity = ?"
+            args = (entity,)
+        sql += " ORDER BY id DESC LIMIT ?"
+        async with self._db.execute(sql, (*args, limit)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def chunks_for_channel(self, channel_id: str) -> list[dict[str, Any]]:
+        async with self._db.execute(
+            """SELECT id, text, start_ts, end_ts, participants FROM chunks
+               WHERE channel_id = ? ORDER BY start_ts ASC""",
+            (channel_id,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def chunks_for_person(
+        self, user_id: str, display_name: str
+    ) -> list[dict[str, Any]]:
+        """Conversations someone took part in, plus ones that name them.
+
+        The second set is about a tenth of the material and carries most of the
+        weight: role and expertise are things colleagues state about a person,
+        not things people claim about themselves.
+        """
+        async with self._db.execute(
+            """SELECT id, text, start_ts, end_ts, channel_id FROM chunks
+               WHERE participants LIKE '%' || ? || '%'
+                  OR text LIKE '%' || ? || '%'
+               ORDER BY start_ts ASC""",
+            (user_id, display_name),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def people_with_activity(self) -> list[dict[str, Any]]:
+        """Everyone who has posted, most recently active first."""
+        async with self._db.execute(
+            """SELECT m.user_id, u.display_name, COUNT(*) AS messages,
+                      MAX(m.ts_num) AS last_ts
+               FROM messages m JOIN users u ON u.user_id = m.user_id
+               WHERE u.display_name != '' AND u.display_name != m.user_id
+               GROUP BY m.user_id ORDER BY last_ts DESC"""
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
 
     async def distinct_users(self, channel_id: str) -> set[str]:
         async with self._db.execute(
@@ -407,6 +506,46 @@ class Store:
         )
         await self._db.commit()
 
+    async def channel_stats(self, channel_id: str) -> dict[str, Any]:
+        """Counts, stored bytes and recency for one channel, in three queries.
+
+        Aggregated in SQL rather than by loading every row: the dashboard polls
+        this for six channels every ten seconds, and materialising 22,000
+        Message objects each time to call len() on the list is work nobody
+        asked for.
+
+        ``bytes`` is the text actually stored — messages plus chunk text plus
+        the embedding matrix. It is what the index costs, which is a more
+        useful number than the file on disk, since SQLite's page file includes
+        free space and every other table.
+        """
+        async with self._db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(text)), 0), MAX(ts_num) "
+            "FROM messages WHERE channel_id = ?",
+            (channel_id,),
+        ) as cur:
+            n_msgs, msg_bytes, newest = await cur.fetchone()
+        async with self._db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(text)), 0), "
+            "COALESCE(SUM(LENGTH(embedding)), 0) FROM chunks WHERE channel_id = ?",
+            (channel_id,),
+        ) as cur:
+            n_chunks, chunk_bytes, vec_bytes = await cur.fetchone()
+        async with self._db.execute(
+            "SELECT backfilled_at FROM ingest_state WHERE channel_id = ?",
+            (channel_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return {
+            "messages": n_msgs,
+            "chunks": n_chunks,
+            "newest": newest,
+            "text_bytes": (msg_bytes or 0) + (chunk_bytes or 0),
+            "vector_bytes": vec_bytes or 0,
+            "bytes": (msg_bytes or 0) + (chunk_bytes or 0) + (vec_bytes or 0),
+            "backfilled": bool(row and row[0]),
+        }
+
     async def is_backfilled(self, channel_id: str) -> bool:
         async with self._db.execute(
             "SELECT backfilled_at FROM ingest_state WHERE channel_id = ?", (channel_id,)
@@ -440,6 +579,27 @@ class Store:
         ) as cur:
             return await cur.fetchone() is not None
 
+    async def filed_reference(self, identity: str) -> bool:
+        """True only once the paper actually reached Zotero.
+
+        Distinct from :meth:`seen_reference`: resolving metadata also records a
+        row, so treating any recorded reference as handled made the filing pass
+        skip six hundred papers it had never filed.
+        """
+        async with self._db.execute(
+            """SELECT 1 FROM literature
+               WHERE identity = ? AND zotero_key IS NOT NULL AND zotero_key != ''""",
+            (identity,),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def zotero_key_for(self, identity: str) -> str | None:
+        async with self._db.execute(
+            "SELECT zotero_key FROM literature WHERE identity = ?", (identity,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row["zotero_key"] if row else None
+
     async def record_reference(
         self,
         identity: str,
@@ -447,6 +607,8 @@ class Store:
         status: str,
         *,
         title: str = "",
+        abstract: str = "",
+        metadata: str = "",
         zotero_key: str | None = None,
         has_pdf: bool = False,
         detail: str = "",
@@ -456,17 +618,69 @@ class Store:
 
         await self._db.execute(
             """INSERT INTO literature
-               (identity, channel_id, title, zotero_key, has_pdf, status, detail,
-                source_ts, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               (identity, channel_id, title, abstract, metadata, zotero_key,
+                has_pdf, status, detail, source_ts, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(identity) DO UPDATE SET
                    status = excluded.status, zotero_key = excluded.zotero_key,
                    has_pdf = excluded.has_pdf, detail = excluded.detail,
-                   title = excluded.title""",
-            (identity, channel_id, title[:400], zotero_key, int(has_pdf), status,
-             detail[:400], source_ts, _time.time()),
+                   title = excluded.title,
+                   abstract = CASE WHEN excluded.abstract != ''
+                                   THEN excluded.abstract ELSE literature.abstract END,
+                   metadata = CASE WHEN excluded.metadata != ''
+                                   THEN excluded.metadata ELSE literature.metadata END""",
+            (identity, channel_id, title[:400], abstract[:2000], metadata,
+             zotero_key, int(has_pdf), status, detail[:400], source_ts, _time.time()),
         )
         await self._db.commit()
+
+    async def resolved_papers(self, channel_id: str) -> dict[str, str]:
+        """identity -> "Title. Abstract", for enriching indexed chunks.
+
+        A shared link is unsearchable on its own: the chunk holds a URL while
+        the words someone would search for live in the paper behind it.
+        """
+        async with self._db.execute(
+            """SELECT identity, title, abstract FROM literature
+               WHERE channel_id = ? AND title != ''""",
+            (channel_id,),
+        ) as cur:
+            out = {}
+            for r in await cur.fetchall():
+                blurb = r["title"]
+                if r["abstract"]:
+                    blurb += " — " + r["abstract"]
+                out[r["identity"]] = blurb
+            return out
+
+    async def stored_metadata(self, channel_id: str) -> dict[str, str]:
+        """identity -> serialised Paper, for filing without re-fetching.
+
+        Resolution is paid for once. Re-fetching six hundred records at filing
+        time is both wasteful and self-defeating: arXiv throttles a client that
+        asks that fast, and the failures look identical to a paper genuinely
+        not existing.
+        """
+        async with self._db.execute(
+            "SELECT identity, metadata FROM literature "
+            "WHERE channel_id = ? AND metadata != ''",
+            (channel_id,),
+        ) as cur:
+            return {r["identity"]: r["metadata"] for r in await cur.fetchall()}
+
+    async def forget_unresolved(self, channel_id: str) -> int:
+        """Drop rows that failed to resolve, so a retry can reach them.
+
+        A transient throttle and a permanent absence are recorded identically,
+        so an unresolved row has to be retryable or one bad afternoon marks a
+        paper missing forever.
+        """
+        cur = await self._db.execute(
+            "DELETE FROM literature WHERE channel_id = ? AND status = 'unresolved'",
+            (channel_id,),
+        )
+        await self._db.commit()
+        return cur.rowcount or 0
 
     async def literature_by_status(self, status: str) -> list[dict[str, Any]]:
         async with self._db.execute(

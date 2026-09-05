@@ -19,6 +19,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
@@ -28,6 +29,14 @@ logger = logging.getLogger(__name__)
 # The key probe costs an HTTP round trip, so a browser refreshing every few
 # seconds must not turn into a request per refresh.
 KEY_CHECK_TTL_SECONDS = 60.0
+
+
+def _bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
 
 
 def _ago(seconds: float | None) -> str:
@@ -128,21 +137,24 @@ class StatusProbe:
         rows = []
         newest_overall: float | None = None
 
+        total_bytes = 0
         for ch in self._bot.settings.channels:
-            msgs = await store.messages_in_range(ch, 0, float("inf"))
-            ids, _ = await store.embeddings_for_channel(ch)
-            newest = max((m.ts_num for m in msgs), default=None)
+            st = await store.channel_stats(ch)
+            newest = st["newest"]
             if newest and (newest_overall is None or newest > newest_overall):
                 newest_overall = newest
+            total_bytes += st["bytes"]
             rows.append(
                 {
                     "channel": names.get(ch, ch),
                     "id": ch,
-                    "messages": len(msgs),
-                    "chunks": len(ids),
+                    "messages": st["messages"],
+                    "chunks": st["chunks"],
                     "newest": _stamp(newest),
                     "newest_ago": _ago(now - newest if newest else None),
-                    "backfilled": await store.is_backfilled(ch),
+                    "backfilled": st["backfilled"],
+                    "bytes": st["bytes"],
+                    "size": _bytes(st["bytes"]),
                 }
             )
 
@@ -158,6 +170,11 @@ class StatusProbe:
                 else None
             ),
             "channels": rows,
+            "messages": sum(r["messages"] for r in rows),
+            "chunks": sum(r["chunks"] for r in rows),
+            "indexed_bytes": total_bytes,
+            "indexed_size": _bytes(total_bytes),
+            "db_size": _bytes(self._db_bytes()),
             "glossary_terms": len(self._bot.glossary.entries),
             "glossary_endorsed": sum(
                 1 for e in self._bot.glossary.entries if e.endorsed
@@ -186,12 +203,52 @@ class StatusProbe:
         return {
             "ok": bool(self._key_ok),
             "detail": self._key_detail,
-            "model": self._bot.settings.model,
+            "model": self._backend_label(),
             "stale": self._key_is_stale(),
             "checked": _ago(
                 now - self._key_checked_at if self._key_checked_at else None
             ),
         }
+
+    def _backend_label(self) -> str:
+        """Which model is actually answering, not merely which is configured.
+
+        With a fallback in play these differ exactly when it matters — a
+        dashboard that always names the local cluster would hide the days the
+        lab's questions were being answered off-site.
+        """
+        st = self._bot.settings
+        if not st.local_enabled:
+            return st.model
+        c = self._bot.completer
+        local_ok = getattr(c, "local_ok", None)
+        fallbacks = getattr(c, "fallbacks", 0)
+        answers = getattr(c, "answers", 0)
+
+        if local_ok is False or getattr(c, "paused", False):
+            # The cluster is behind the VPN, so this is usually the laptop's
+            # network rather than the cluster being down.
+            label = f"{st.model} — {st.local_model} unreachable (VPN?)"
+        else:
+            label = st.local_model
+        if fallbacks:
+            label += f" · {fallbacks}/{answers} answered off-site"
+        return label
+
+    def _db_bytes(self) -> int:
+        """The SQLite file plus its write-ahead log.
+
+        Larger than the indexed text: it carries every other table, and SQLite
+        keeps freed pages rather than returning them to the filesystem.
+        """
+        total = 0
+        db = Path(self._bot.settings.db_path)
+        for path in (db, db.with_suffix(db.suffix + "-wal")):
+            try:
+                total += path.stat().st_size
+            except OSError:
+                pass
+        return total
 
     def _key_is_stale(self) -> bool:
         """True when .env holds a different key than this process is using.
@@ -234,8 +291,11 @@ async def _page(request: web.Request) -> web.Response:
 
 
 def build_app(bot) -> web.Application:
+    from slackqa import profileweb
+
     app = web.Application()
     app[PROBE] = StatusProbe(bot)
+    profileweb.attach(app, bot.settings.profiles_dir, getattr(bot, 'store', None))
     app.router.add_get("/", _page)
     app.router.add_get("/health", _health)
     return app
@@ -279,7 +339,12 @@ th,td { text-align:left; padding:.3rem .5rem .3rem 0; }
 th { color:#888; font-weight:600; font-size:.78rem; text-transform:uppercase;
   letter-spacing:.03em; }
 td.num { font-variant-numeric:tabular-nums; }
+td.num, th.num { text-align:right; }
+tr.total td { border-top:1px solid #d5d8dd; font-weight:650; padding-top:.45rem; }
+.ok { color:#1a7f45; }
+.partial { color:#b26a00; font-weight:600; }
 .foot { color:#999; font-size:.78rem; margin-top:1.4rem; }
+.foot a { color:#2f6fd0; }
 code { background:#f2f2f2; padding:.1rem .3rem; border-radius:3px; font-size:.85em; }
 @media (prefers-color-scheme: dark) {
   body { background:#15171b; color:#e6e6e6; }
@@ -288,14 +353,17 @@ code { background:#f2f2f2; padding:.1rem .3rem; border-radius:3px; font-size:.85
   .verdict.up { color:#5fce93; } .verdict.down { color:#f07a7a; }
   .verdict.warn { color:#e0b552; }
   code { background:#23262c; }
+  tr.total td { border-top-color:#2b2f36; }
+  .ok { color:#71cf95; } .partial { color:#e0b552; }
 }
 </style></head>
 <body><div class="wrap">
 <h1>slackqa status</h1>
 <p class="sub" id="sub">loading…</p>
 <div id="cards"></div>
-<p class="foot">Polls <code>/health</code> every 10s. That endpoint returns the
-same data as JSON if you want to script against it.</p>
+<p class="foot"><a href="/profiles">Profiles</a> &middot; polls
+<code>/health</code> every 10s, which returns the same data as JSON if you want
+to script against it.</p>
 </div>
 <script>
 function card(dot, title, verdict, detail, extra) {
@@ -312,11 +380,22 @@ function esc(s) {
 function render(d) {
   var l = d.listener, i = d.index, k = d.api_key;
   var rows = i.channels.map(function (c) {
+    // A channel still backfilling holds only part of its history, so an answer
+    // from it can be wrong by omission. That is worth a mark of its own.
+    var state = c.backfilled
+      ? '<span class="ok">complete</span>'
+      : '<span class="partial">backfilling</span>';
     return '<tr><td>#' + esc(c.channel) + '</td><td class="num">' + c.messages +
-      '</td><td class="num">' + c.chunks + '</td><td>' + esc(c.newest_ago) + '</td></tr>';
+      '</td><td class="num">' + c.chunks + '</td><td class="num">' + esc(c.size) +
+      '</td><td>' + esc(c.newest_ago) + '</td><td>' + state + '</td></tr>';
   }).join('');
-  var table = '<table><tr><th>channel</th><th>messages</th><th>chunks</th>' +
-    '<th>newest</th></tr>' + rows + '</table>';
+  var table = '<table><tr><th>channel</th><th class="num">messages</th>' +
+    '<th class="num">chunks</th><th class="num">size</th>' +
+    '<th>newest message</th><th>history</th></tr>' + rows +
+    '<tr class="total"><td>' + i.channels.length + ' channels</td>' +
+    '<td class="num">' + i.messages + '</td><td class="num">' + i.chunks +
+    '</td><td class="num">' + esc(i.indexed_size) + '</td><td colspan="2"></td></tr>' +
+    '</table>';
 
   document.getElementById('cards').innerHTML =
     card(l.ok ? 'up' : 'warn', 'Listener', l.ok ? 'up' : 'socket down',
@@ -324,10 +403,17 @@ function render(d) {
          ' &middot; last Slack event ' + esc(l.last_event) +
          ' &middot; last question ' + esc(l.last_question)) +
     card(i.ok ? 'up' : 'down', 'Index last updated',
-         i.ok ? esc(i.newest_ago) : 'empty',
-         'newest indexed message ' + esc(i.newest) + ' &middot; last sync ' +
-         esc(i.last_sync) + ' &middot; glossary ' + i.glossary_terms + ' terms (' +
-         i.glossary_endorsed + ' endorsed)', table) +
+         i.ok ? 'synced ' + esc(i.last_sync) : 'empty',
+         'newest indexed message ' + esc(i.newest) + ' (' + esc(i.newest_ago) +
+         ') &middot; glossary ' + i.glossary_terms + ' terms (' +
+         i.glossary_endorsed + ' endorsed)') +
+    card(i.ok ? 'up' : 'down', 'Indexed data',
+         esc(i.indexed_size),
+         i.messages + ' messages in ' + i.chunks + ' chunks across ' +
+         i.channels.length + ' channels &middot; database file ' + esc(i.db_size) +
+         '. Sizes are stored text plus embeddings; "newest message" is how ' +
+         'recently the channel was <i>active</i>, not when it was last synced.',
+         table) +
     card(k.ok ? 'up' : (k.stale ? 'warn' : 'down'), 'API key',
          k.ok ? 'usable' : (k.stale ? 'restart needed' : 'rejected'),
          (k.stale ? '<b>A different key is in .env.</b> This process is still ' +

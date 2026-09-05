@@ -37,6 +37,14 @@ BOT_TAG = "added-by:LAIRbot"
 # Marks an item whose PDF is behind a paywall we will not automate around.
 NEEDS_PDF_TAG = "needs-pdf"
 
+# Prefix for "this was pointed at that person". Zotero's tag selector sorts
+# alphabetically, so a shared prefix keeps every reader tag together.
+READER_TAG_PREFIX = "for:"
+
+
+def reader_tag(name: str) -> str:
+    return f"{READER_TAG_PREFIX}{name.strip()}"
+
 
 class ZoteroError(RuntimeError):
     pass
@@ -122,6 +130,36 @@ class Zotero:
         key = next(iter(created.values()))["key"]
         logger.info("Created Zotero collection %r (%s)", name, key)
         return key
+
+    async def index_existing(self) -> tuple[dict[str, str], dict[str, str]]:
+        """Every item's DOI and title, fetched once.
+
+        Two lookups per paper is fine for ten and absurd for six hundred: it
+        turns a bulk run into thousands of round trips against a library small
+        enough to hold in memory.
+        """
+        by_doi: dict[str, str] = {}
+        by_title: dict[str, str] = {}
+        start = 0
+        async with aiohttp.ClientSession() as s:
+            while True:
+                page = await self._request(
+                    s, "GET", "/items/top",
+                    params={"limit": "100", "start": str(start),
+                            "format": "json"},
+                )
+                if not page:
+                    break
+                for it in page:
+                    d = it.get("data", {})
+                    if d.get("DOI"):
+                        by_doi[d["DOI"].lower()] = d["key"]
+                    if d.get("title"):
+                        by_title[" ".join(d["title"].lower().split())] = d["key"]
+                if len(page) < 100:
+                    break
+                start += 100
+        return by_doi, by_title
 
     async def find_by_doi(self, doi: str) -> str | None:
         """Existing item key for this DOI, so a re-scan does not duplicate."""
