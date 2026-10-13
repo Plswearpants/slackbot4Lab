@@ -16,6 +16,12 @@ each working session**. Cite decisions by ID rather than restating them; when
 one is overturned, strike it through and keep it — that we once thought
 otherwise is part of the record.
 
+## Deployment
+
+[docs/deployment.md](docs/deployment.md) is the runbook for the institute
+machine: end state, transfer steps, the systemd unit, and the single-listener
+rule. Keep it current when the deployment changes.
+
 ## Agent skills
 
 ### Issue tracker
@@ -23,10 +29,9 @@ otherwise is part of the record.
 Issues and PRDs live as GitHub issues, driven through the `gh` CLI. See
 `docs/agents/issue-tracker.md`.
 
-> **Not yet usable.** This repo has no git remote, so `gh` has nothing to talk
-> to. Create a **private** GitHub repo and add it as `origin` before any skill
-> tries to file an issue — `SPEC.md` and `README.md` name the workspace URL,
-> channel IDs and lab specifics.
+> `origin` is the **private** repo `Plswearpants/LAIRbot`. It must stay private:
+> `SPEC.md`, `README.md` and `docs/deployment.md` name the workspace URL,
+> channel IDs, the GPU cluster host and lab specifics.
 
 ### Triage labels
 

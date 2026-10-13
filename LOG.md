@@ -32,7 +32,7 @@ once thought otherwise is part of the record.
 | **D2** | Strict per-channel isolation — no cross-channel code path exists, rather than a filter that could be bypassed. | 08-06 | A filter is a bug away from leaking. Absence of the path is the guarantee. |
 | **D3** | Hybrid retrieval: BM25 + vectors fused with RRF. | 08-06 | Lexical alone misses paraphrase; vectors alone miss exact jargon (`PtSe2`, `LT-STM`). Lab language needs both. |
 | **D4** | Chunk by conversation, not by token window — threads are units, unthreaded messages group on a 10-minute gap. | 08-06 | The answer to "why did the tip crash" is a five-message exchange. Splitting it mid-argument retrieves half a reason. |
-| **D5** | Local embeddings, hosted answers. | 08-06 | Embedding 22k messages hosted is a recurring bill for something an ONNX model does on a laptop. Generation is where hosted quality actually matters. |
+| **D5** | Local embeddings, ~~hosted answers~~. **Superseded 09-01:** see **D16**. | 08-06 | Embedding 22k messages hosted is a recurring bill for something an ONNX model does on a laptop. The second half held only until the lab had its own GPUs. |
 | **D6** | ~~Append-only; ignore edits and deletes.~~ **Superseded 08-06:** honour both, with real `DELETE`. | 08-06 | Decided during scoping, reversed the same session. A message someone deleted should not be quotable by the bot afterwards. See **P3**. |
 | **D7** | OpenRouter as the single model gateway, model pinned. | 08-06 | One key, one place to swap models, no vendor SDK spread through the code. |
 | **D8** | Tests encode failures we actually observed, not hypotheticals. | 08-07 | Nearly every test in `test_literature.py` is a real message shape from `#coolpapers` that broke something. |
@@ -42,7 +42,11 @@ once thought otherwise is part of the record.
 | **D12** | Profiles are append-only with rolling resolution: one paragraph per past year, one or two sentences per month for the last six, recalibrated on update. | 08-19 | Recent detail is what a question usually needs; older detail compresses without losing the arc. Bounded size without a hard cutoff. |
 | **D13** | Generation never overwrites human review. | 08-19 | An endorsed abstract is not regenerated; a reviewed timeline entry is never folded into its year. Condensation is otherwise safe because the source messages survive — but a person's judgement exists *only* in the profile, so folding it destroys it. |
 | **D14** | Instrument profiles are seeded verbatim from the lab's published instrument pages. | 08-19 | The lab already wrote good descriptions. Paraphrasing them would add drift and subtract authority. |
-| **D15** | Profile context reaches the model two ways: deterministic injection when a question names an entity, plus a tool call for open-ended questions. | 08-19 | Injection alone can't answer "who knows most about cryostats"; a tool alone means the model must think to ask. *Agreed; not yet built.* |
+| **D15** | Profile context reaches the model two ways: deterministic injection when a question names an entity, plus a tool call for open-ended questions. | 08-19 | Injection alone can't answer "who knows most about cryostats"; a tool alone means the model must think to ask. **Injection shipped 09-01; `search_profiles` still open.** |
+
+| **D16** | Answers come from the lab's own GPU cluster first, with a hosted model as fallback. A refusal is an answer and is never retried elsewhere. | 09-01 | Supersedes half of **D5**: once the lab has its own hardware, generation need not leave it. Retrying against a second model until one is willing to speak would demolish **D1**, so only a failure — unreachable, timeout, error, empty — triggers the fallback. |
+| **D17** | Ambiguity is narrowed in code first, and only what the channel cannot settle is handed to the model. | 09-01 | Extends **D2**'s reasoning to names: if one Alex appears in the retrieved excerpts, that is the Alex meant, deterministically and for free. The model decides only what evidence cannot, and says a name is ambiguous rather than guessing. |
+| **D18** | Domain knowledge that differs between labs is configuration, not code. | 09-28 | `skills/answering/SKILL.md` is already a path; `seeds.py` is not. The distinction only matters if another lab ever runs this, but it is cheap to respect now. |
 
 ## Standing decisions — privacy and security
 
@@ -57,34 +61,138 @@ once thought otherwise is part of the record.
 | **P7** | The dashboard is unauthenticated and localhost-only, and the page says so in a visible banner. | 08-19 | Deferring auth is a legitimate choice for internal validation. Looking protected while not being protected is not. |
 | **P8** | Third-party APIs are used at their stated pace: arXiv 3 s, Crossref 0.2 s, a `User-Agent` carrying a contact address. | 08-12 | arXiv throttles silently — by returning no entry, which is indistinguishable from the paper not existing. We learned this by losing 86 papers to it. |
 | **P9** | Answers name people; they do not `@`-mention them. | 08-21 | Answering someone's question should not generate a notification for a third party who didn't ask one. |
+| **P10** | While `LOCAL_ONLY` is false, channel content leaves the lab whenever the cluster is unreachable — silently, with nothing visible in Slack. The dashboard reports which backend served and counts `N/M answered off-site`. | 09-01 | "Nothing leaves the lab" is currently a tendency, not a promise. That is a defensible choice, but it must be a stated one: do not tell colleagues otherwise while this is false. |
+| **P11** | Never `source .env`. Exported variables outrank the file, so a stale export silently wins and also defeats the credential hot reload. Every command warns when one disagrees with the file. | 09-01 | Cost ten minutes of debugging HTTP 405s against a URL that had already been fixed on disk. Secrets are named in the warning, never printed. |
 
 ---
 
 ## What we want to do next
 
 **Immediate**
-- **Commit the outstanding work.** Nothing has been committed since `4c83484` (08-12): the user roster, mention resolution, chunk enrichment, schema migrations, literature pagination, the filed/seen fix, and the entire profile system.
-- **Glossary migration** — move `status` / `timeline` / `as-of` out of glossary entries into instrument profile timelines and delete the `refresh_volatile` machinery. The only destructive step outstanding; do it as its own reversible commit.
+- **Off-machine backups.** The institute machine now holds the only current
+  copy. Nightly backups run there at 03:00 and a restore is verified, but a
+  backup on the same disk is not one: `rsync -az qmi:~/slackbot/backups/
+  ~/slackqa-offsite/` from the laptop, on a schedule.
+- **Retire the laptop copy** — but only after the service survives a reboot
+  unaided and the off-machine copy exists. It is 99 messages stale, so rolling
+  back now costs a `slackqa sync`.
+- **Glossary migration** — move `status` / `timeline` / `as-of` out of glossary
+  entries into instrument profile timelines and delete `refresh_volatile`. The
+  only destructive step outstanding; its own reversible commit.
 
 **Next**
-- **Deterministic profile injection** into the answering prompt when a question names a person or instrument (**D15**).
-- **`search_profiles(query)` tool** for open-ended questions (**D15**).
-- **Slack-signed links** for dashboard auth, replacing **P7**'s deferral — `@LAIRbot edit my profile` issues a signed URL.
-- **The remaining 42 person profiles.** Three of 45 exist; 172 person-years of history are unwritten.
+- **`search_profiles(query)` tool** — the open half of **D15**.
+- **The remaining 42 person profiles.** Three of 45 exist.
+- **Slack-issued signed links** for dashboard auth, replacing **P7**'s
+  deferral. Needs the dashboard to be reachable at all first (see below).
 
-**Scoped, not started**
-- **Filing receipts via reactions** — react 📚 when a shared paper reaches Zotero, ⚠️ when it needs a PDF. Needs no new scope and no reinstall. Makes an invisible pipeline visible.
-- **Channel canvases** for instrument profiles and the glossary (see 08-21).
-- **Onboarding DM** — a new channel member gets that instrument's profile and the glossary.
+**Decisions waiting on us, not on code**
+- **`LOCAL_ONLY`** — whether **P10** becomes a promise. On campus the cluster is
+  directly reachable, so the fallback is now a genuine outage signal rather
+  than a daily event. This is the moment to decide.
+- **Service account vs personal login** — `.env` on the institute machine holds
+  the Slack, Zotero and OpenRouter credentials under a personal account.
+- **Other labs.** Groups outside LAIR have asked to use this. Two shapes:
+  run instances for them, or give them the software and the runbook. The code
+  is nearly ready for either — almost everything is already per-directory
+  configuration, and `env_file=".env"` resolves relative to the working
+  directory, so one `systemd` template and one directory per lab would do it.
+  The open question is custody, not engineering: hosting means holding another
+  group's Slack history and bot token, and appearing in your backups. If we do
+  host, it is one process per lab — **D2**'s reasoning says isolation should be
+  the absence of a code path, not a filter. Also verify first whether a
+  distributed Slack app forfeits the internal-app rate-limit exemption; if it
+  does, each lab must create their own app.
+- **Dashboard reachability** — loopback plus an SSH tunnel works for one person
+  over VPN. The UBC SSH Proxy hostname is still unknown, and falcon cannot
+  forward. Do not expose the port as a shortcut (**P7**).
 
 **Small and known**
 - `ZnPc` / `ZnPC` are not case-deduplicated in mined systems lists.
 - `HCl`, `PIC`, `PGYP`, `SQAO`, `S3W` still slip through the materials stoplist.
-- 174 of 1,120 references remain unresolvable — bare URLs with no DOI. An RSC URL→DOI pattern would recover some.
-
----
+- 174 of 1,120 references remain unresolvable — bare URLs with no DOI. An RSC
+  URL→DOI pattern would recover some.
+- `seeds.py` is the last LAIR-specific thing baked into code (**D18**).
 
 ## Sessions
+
+### 2026-09-01 – 10-13 — Profiles reach the model; the bot leaves the laptop
+
+**Abstract.** Two arcs. First, the profile system stopped being a read-only
+knowledge base and started reaching the answering prompt. Second, generation
+moved onto the lab's own GPUs and the whole service moved onto an always-on
+machine — which took two attempts, because the first one's CPU was from 2008.
+
+**Details — profiles now inform answers.**
+- Deterministic injection: a question naming a person or instrument gets that
+  profile ahead of the excerpts. Rule 9 in the system prompt places profiles on
+  the *interpretation* side, like the glossary — they say who is meant, they
+  never become claims, and they are never citable. That had to be explicit,
+  because rule 1 forbids outside knowledge about people and a profile is
+  exactly that.
+- Ambiguity is narrowed in code before the model sees it (**D17**). Two guards
+  were needed: a first name must be capitalised as written, *and* not be an
+  ordinary English word. `Will Ho` against "will the tip crash" was the
+  motivating case; the stoplist was briefly broken by comparing `"Will"` to a
+  lowercase set, so only the sentence-start capitalisation leaked.
+- Candidate groups are labelled mutually exclusive and carry abstracts only.
+  Unlabelled, a model reads three profiles for one name as three relevant
+  people and blends them into a composite who does not exist.
+- `Alex` → `Alexander` is not inferred. Guessing that `Jo` means John or Joan
+  is the kind of confident wrong answer this bot exists to avoid, so a nickname
+  is a declared `aliases:` entry — and then it *creates* ambiguity rather than
+  bypassing it.
+- Per-entry endorsement and editing, which produced **D13**'s extension: a
+  reviewed timeline entry is never folded into its year. Condensation is safe
+  only because the source messages survive; a person's judgement exists only in
+  the profile.
+
+**Details — local models.**
+- `LocalCompleter` plus `FallbackCompleter` (**D16**). GLM and Qwen both held
+  the citation and refusal discipline in testing; notably Qwen volunteered that
+  2023 material did not answer a question about *recent* issues, which is
+  closer to **D1**'s spirit than the confident answer GLM gave.
+- The dashboard names the backend that *served*, and counts `N/M answered
+  off-site` (**P10**). A snapshot of the last answer hid whole mornings.
+- `.env` shadowing guard (**P11**), after `set -a; source .env` left a stale
+  URL outranking the corrected file and produced ten minutes of HTTP 405s.
+- An **Indexed data** card: per-channel messages, chunks, size and backfill
+  state. It also separated "last synced" from "newest message" — a quiet
+  channel reading "8d ago" looked broken. Along the way, the old builder was
+  materialising all 22,683 `Message` objects on every 10-second poll just to
+  call `len()`; now three aggregate queries per channel.
+
+**Details — the migration.**
+- `qmi-463` turned out to be a 2008 Xeon E5462: SSE4.1, no SSE4.2. numpy 2.x
+  and `onnxruntime` both refuse to run, so `fastembed` and half of **D3** were
+  dead and the test suite could not even be collected. Not fixable — bare
+  metal, no CPU model to change.
+- `qmi-nf-cr` (Xeon E-2124G, 2018, Ubuntu 24.04, ext4 on local RAID) works:
+  383 tests pass *on the target*, the check that was impossible before.
+- Access is **port 7743** over the PHAS VPN — no gateway, despite the advice.
+  `ssh.phas.ubc.ca` accepts CWL but has TCP forwarding disabled, so it cannot
+  be a jump host.
+- The cluster had renamed its models; `.env` asked for one that no longer
+  existed, got HTTP 400, and answered everything via OpenRouter. Then GLM-5.3
+  turned out to be a reasoning model whose `reasoning_content` is billed
+  against the same `max_tokens`, so a RAG-sized prompt spent the whole budget
+  thinking and returned an empty completion. `MAX_ANSWER_TOKENS=6144`.
+- Data verified by table, not by assumption: `literature` 1,120, `users` 64,
+  `profile_audit` 5 all identical; `messages` ahead by 99 because the service
+  caught up after cutover. A restore from the nightly backup was proven, not
+  assumed.
+- Three of those four failures were **invisible from Slack** — answers kept
+  arriving, cited and plausible, from the wrong provider. Recorded in
+  [docs/deployment.md](docs/deployment.md) §12.
+
+**Decisions.** **D16**, **D17**, **D18**, **P10**, **P11**. **D5** half
+superseded; **D15** half shipped; **D13** extended to entries. **D10** upheld
+after reconsidering canvases — a canvas edit notifies nobody, so it remains on
+the table where proactive messages do not.
+
+**Left open deliberately.** `LOCAL_ONLY`, the service-account question, and
+whether to host other labs. All three are custody decisions rather than
+engineering ones, and all three are now listed above rather than drifting.
 
 ### 2026-08-21 — Per-entry review, Slack action scoping, and this log
 
