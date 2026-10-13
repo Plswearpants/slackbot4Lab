@@ -83,6 +83,16 @@ Use that only when you have not already been given a second set of excerpts.\
 """
 
 
+class LocalOnlyUnavailable(CredentialsError):
+    """The lab's own model is unreachable and we are not allowed to go outside.
+
+    A subclass of CredentialsError so existing handling still treats it as a
+    configuration problem rather than a crash, but distinguishable so Slack can
+    be told the truthful thing: the index is fine, the question was not sent
+    anywhere else, and this will fix itself when the cluster returns.
+    """
+
+
 class Completer(Protocol):
     async def complete(self, system: str, user: str) -> str: ...
 
@@ -556,15 +566,20 @@ class FallbackCompleter:
         except Exception as exc:
             self.local_ok = False
             if self._fallback is None:
-                # LOCAL_ONLY: there is nowhere else to go, so this is a config
-                # problem the user has to see stated, not a traceback.
-                raise CredentialsError(
-                    f"The local cluster is unreachable ({exc}) and LOCAL_ONLY is "
-                    "set, so there is no fallback. Check LOCAL_API_BASE in .env "
-                    "and that you are on the lab network, or unset LOCAL_ONLY to "
-                    "allow OpenRouter."
-                ) from exc
-            logger.warning("Local cluster unavailable at startup: %s", exc)
+                # LOCAL_ONLY, and nowhere else to go. Still not fatal: refusing
+                # to send questions outside the lab does not require the service
+                # to die. Exiting here would take the listener, the dashboard
+                # and ingestion with it, and leave a restart loop with nothing
+                # able to report why. Come up, say so loudly, and refuse
+                # individual questions instead.
+                logger.error(
+                    "LOCAL ONLY and the cluster is unreachable (%s). The bot is "
+                    "running but cannot answer; it will not send questions "
+                    "outside the lab. Check LOCAL_API_BASE and the network.",
+                    exc,
+                )
+            else:
+                logger.warning("Local cluster unavailable at startup: %s", exc)
         if self._fallback is not None:
             await self._fallback.check_credentials()
 
@@ -590,14 +605,14 @@ class FallbackCompleter:
                 self.local_ok = False
                 logger.warning("Local completion failed (%s); falling back", exc)
                 if self._fallback is None:
-                    raise CredentialsError(
+                    raise LocalOnlyUnavailable(
                         f"The local cluster could not answer ({exc}) and "
                         "LOCAL_ONLY is set, so there is no fallback. Unset "
                         "LOCAL_ONLY to allow OpenRouter."
                     ) from exc
 
         if self._fallback is None:
-            raise CredentialsError(
+            raise LocalOnlyUnavailable(
                 "The local cluster is unavailable and LOCAL_ONLY is set, so no "
                 "answer can be produced. Unset LOCAL_ONLY to fall back to "
                 "OpenRouter."

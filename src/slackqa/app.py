@@ -25,6 +25,7 @@ from slackqa.answerer import (
     CredentialsError,
     FallbackCompleter,
     LocalCompleter,
+    LocalOnlyUnavailable,
     OpenRouterCompleter,
     Turn,
 )
@@ -335,13 +336,20 @@ class SlackQA:
             )
         except Exception as e:
             logger.exception("Failed answering in channel=%s", channel_id)
-            auth = isinstance(e, CredentialsError) or type(e).__name__ == "AuthenticationError"
-            text = (
-                "My model provider rejected the API key, so I can't answer until "
-                "it's renewed. Nothing is wrong with the channel index."
-                if auth
-                else "Something went wrong answering that — check the logs."
-            )
+            if isinstance(e, LocalOnlyUnavailable):
+                text = (
+                    "I can't reach the lab's own model right now, and I'm set "
+                    "not to send questions anywhere outside the lab — so I "
+                    "haven't. Nothing is wrong with the channel index; try "
+                    "again once the cluster is back."
+                )
+            elif isinstance(e, CredentialsError) or type(e).__name__ == "AuthenticationError":
+                text = (
+                    "My model provider rejected the API key, so I can't answer "
+                    "until it's renewed. Nothing is wrong with the channel index."
+                )
+            else:
+                text = "Something went wrong answering that — check the logs."
             await client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=text)
         finally:
             try:

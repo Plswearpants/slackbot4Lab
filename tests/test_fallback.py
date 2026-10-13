@@ -96,10 +96,10 @@ async def test_recovery_resets_the_failure_count():
 async def test_local_only_never_leaves_the_lab():
     """With no fallback configured, a dead cluster raises rather than quietly
     sending channel content to a hosted model."""
-    from slackqa.answerer import CredentialsError
+    from slackqa.answerer import LocalOnlyUnavailable
 
     c = FallbackCompleter(Stub(fail=ConnectionError("refused")), None)
-    with pytest.raises(CredentialsError):
+    with pytest.raises(LocalOnlyUnavailable):
         await c.complete("s", "u")
 
 
@@ -110,14 +110,31 @@ async def test_startup_tolerates_a_cluster_that_is_down():
     await c.check_credentials()
 
 
-async def test_local_only_startup_reports_a_cause_not_a_traceback():
-    """An unreachable cluster under LOCAL_ONLY is a config problem the user has
-    to read, not a stack trace — the CLI already renders CredentialsError."""
-    from slackqa.answerer import CredentialsError
+async def test_local_only_startup_does_not_kill_the_service(caplog):
+    """Refusing to send questions outside the lab must not require the process
+    to die. Exiting took the listener, the dashboard and ingestion with it and
+    left a 30-second restart loop with nothing able to report why."""
+    import logging
+
+    from slackqa.answerer import LocalOnlyUnavailable
 
     c = FallbackCompleter(Stub(fail=ConnectionError("refused")), None)
-    with pytest.raises(CredentialsError, match="LOCAL_ONLY"):
-        await c.check_credentials()
+    with caplog.at_level(logging.ERROR):
+        await c.check_credentials()          # must not raise
+    assert "LOCAL ONLY" in caplog.text, "the operator still has to be told"
+    assert c.local_ok is False
+
+    # Individual questions still refuse, and say which kind of problem it is.
+    with pytest.raises(LocalOnlyUnavailable):
+        await c.complete("s", "u")
+
+
+async def test_local_only_failure_is_recognisable_as_a_config_problem():
+    """Slack says something truthful and specific; the CLI keeps rendering it
+    as configuration rather than a crash."""
+    from slackqa.answerer import CredentialsError, LocalOnlyUnavailable
+
+    assert issubclass(LocalOnlyUnavailable, CredentialsError)
 
 
 # --------------------------------------- visibility when the VPN is the gate
