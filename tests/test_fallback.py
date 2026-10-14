@@ -167,3 +167,32 @@ async def test_a_startup_check_records_reachability_without_failing():
     c = FallbackCompleter(Stub(fail=ConnectionError("no route")), Stub("ok"))
     await c.check_credentials()
     assert c.local_ok is False
+
+
+async def test_a_transient_empty_response_is_retried_before_giving_up():
+    """Observed in production: HTTP 200 with no content on a question that
+    answered normally moments later. Under LOCAL_ONLY nothing absorbs that, so
+    one blip would cost a real answer in Slack."""
+    from slackqa.answerer import LocalCompleter
+
+    calls = {"n": 0}
+
+    class FakeChoice:
+        def __init__(self, content):
+            self.message = type("M", (), {"content": content})()
+            self.finish_reason = "stop"
+
+    class FakeResp:
+        def __init__(self, content):
+            self.choices = [FakeChoice(content)]
+            self.usage = type("U", (), {"completion_tokens": 7})()
+
+    class FakeCompletions:
+        async def create(self, **kw):
+            calls["n"] += 1
+            return FakeResp("" if calls["n"] == 1 else "a real answer")
+
+    c = LocalCompleter("k", "m", "http://x/api", attempts=2)
+    c._client = type("C", (), {"chat": type("Ch", (), {"completions": FakeCompletions()})()})()
+    assert await c.complete("s", "u") == "a real answer"
+    assert calls["n"] == 2

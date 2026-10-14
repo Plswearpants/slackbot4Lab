@@ -13,6 +13,7 @@ destroys trust fastest, because it is indistinguishable from a real answer.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -472,14 +473,16 @@ class LocalCompleter:
         max_tokens: int = 1024,
         temperature: float = 0.0,
         timeout: float = 90.0,
+        attempts: int = 2,
     ) -> None:
         from openai import AsyncOpenAI
 
         self._base_url = str(base_url).rstrip("/")
         self._client = AsyncOpenAI(
             api_key=api_key or "unused", base_url=self._base_url, timeout=timeout,
-            max_retries=0,  # the fallback is the retry
+            max_retries=0,  # retried here instead, so empties count too
         )
+        self._attempts = max(1, attempts)
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
@@ -504,18 +507,47 @@ class LocalCompleter:
             )
 
     async def complete(self, system: str, user: str) -> str:
-        resp = await self._client.chat.completions.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            temperature=self._temperature,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        if not resp.choices:
-            raise RuntimeError("local cluster returned no choices")
-        return resp.choices[0].message.content or ""
+        """One answer, retrying a transient empty response.
+
+        The cluster occasionally returns HTTP 200 with no content — observed
+        once on a question that answered normally moments later. With
+        LOCAL_ONLY there is no fallback to absorb that, so a single blip would
+        cost a real answer in Slack. Retried here rather than by the client,
+        because an empty 200 is not an error the HTTP layer would retry.
+        """
+        last = ""
+        for attempt in range(1, self._attempts + 1):
+            resp = await self._client.chat.completions.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                temperature=self._temperature,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            )
+            if not resp.choices:
+                last = ""
+            else:
+                choice = resp.choices[0]
+                last = choice.message.content or ""
+                if last.strip():
+                    return last
+                # Empty content. Say why, so truncation is distinguishable from
+                # a hiccup: a reasoning model billing thinking against the same
+                # budget shows finish_reason="length".
+                usage = getattr(resp, "usage", None)
+                logger.warning(
+                    "Local model returned empty content (attempt %d/%d, "
+                    "finish_reason=%s, completion_tokens=%s). Raise "
+                    "MAX_ANSWER_TOKENS if this says 'length'.",
+                    attempt, self._attempts,
+                    getattr(choice, "finish_reason", "?"),
+                    getattr(usage, "completion_tokens", "?"),
+                )
+            if attempt < self._attempts:
+                await asyncio.sleep(1.0)
+        raise RuntimeError(f"empty completion after {self._attempts} attempts")
 
 
 class FallbackCompleter:
