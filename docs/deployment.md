@@ -303,11 +303,14 @@ crontab -e
 Use `.backup`, not `cp` — copying a live SQLite file while it is being written
 produces a corrupt snapshot.
 
-**Off the machine** — the laptop is now free and is the obvious target. From the
-laptop, on a schedule:
+**Off the machine** — **monthly, by hand, while you are at the laptop.** The
+SSH key lives in Secretive's Secure Enclave and needs Touch ID for every use,
+so a scheduled job would fail silently every time with nobody there to
+authorise it. At this stage a monthly copy is enough, and doing it in person
+avoids needing a second, unattended key:
 
 ```bash
-rsync -az qmi:~/slackqa/backups/ ~/slackqa-offsite/
+rsync -az qmi:~/slackbot/backups/ ~/slackqa-offsite/
 ```
 
 This is what survives the institute machine itself being lost. If the lab has a

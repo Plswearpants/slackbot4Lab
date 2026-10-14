@@ -46,6 +46,7 @@ once thought otherwise is part of the record.
 
 | **D16** | Answers come from the lab's own GPU cluster first, with a hosted model as fallback. A refusal is an answer and is never retried elsewhere. | 09-01 | Supersedes half of **D5**: once the lab has its own hardware, generation need not leave it. Retrying against a second model until one is willing to speak would demolish **D1**, so only a failure — unreachable, timeout, error, empty — triggers the fallback. |
 | **D17** | Ambiguity is narrowed in code first, and only what the channel cannot settle is handed to the model. | 09-01 | Extends **D2**'s reasoning to names: if one Alex appears in the retrieved excerpts, that is the Alex meant, deterministically and for free. The model decides only what evidence cannot, and says a name is ambiguous rather than guessing. |
+| **D19** | The model drives retrieval through a `search_channel` tool. The harness supplies only what the model cannot know — today's date, the channel roster, and the channel itself — and executes the searches it asks for. | 10-13 | Temporal parsing ("last month", "since September") and person extraction are things the model already does well; writing regex for them would be harness standing in for capability. The tool has no channel parameter, so **D2** stays absolute. First turn must search; a 60 s wall-clock budget, not a round count, ends the loop. Born from Yuan's Oct 6 update being out-ranked by a 2025 conversation and a password note. |
 | **D18** | Domain knowledge that differs between labs is configuration, not code. | 09-28 | `skills/answering/SKILL.md` is already a path; `seeds.py` is not. The distinction only matters if another lab ever runs this, but it is cheap to respect now. |
 
 ## Standing decisions — privacy and security
@@ -69,10 +70,12 @@ once thought otherwise is part of the record.
 ## What we want to do next
 
 **Immediate**
-- **Off-machine backups.** The institute machine now holds the only current
-  copy. Nightly backups run there at 03:00 and a restore is verified, but a
-  backup on the same disk is not one: `rsync -az qmi:~/slackbot/backups/
-  ~/slackqa-offsite/` from the laptop, on a schedule.
+- **Off-machine backups — monthly, by hand.** Nightly backups run on the
+  institute machine and a restore is verified. The off-machine copy is a
+  monthly `rsync` run in person, since the Secure Enclave key needs Touch ID.
+- **Redact credentials from the index.** A password posted in `#omicron` is
+  retrievable and was quoted back verbatim in answers. Rotate it; then scrub
+  high-confidence credential shapes at ingest and from existing chunks.
 - **Retire the laptop copy** — but only after the service survives a reboot
   unaided and the off-machine copy exists. It is 99 messages stale, so rolling
   back now costs a `slackqa sync`.
