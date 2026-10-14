@@ -14,12 +14,13 @@ destroys trust fastest, because it is indistinguishable from a real answer.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -38,7 +39,7 @@ class CredentialsError(RuntimeError):
 
 _SEARCH_RE = re.compile(r"^\s*SEARCH:\s*(.+)$", re.MULTILINE)
 
-SYSTEM_PROMPT = f"""\
+RULES = f"""\
 You answer questions about a Slack channel using only the excerpts provided.
 
 Rules, in order of importance:
@@ -75,6 +76,11 @@ name, at most one of them is meant — choose the one the excerpts support. If \
 the excerpts do not distinguish them, say the name is ambiguous and ask which \
 person is meant. Do not blend two candidates into one person, and do not guess.
 
+"""
+
+# The legacy single-shot path asks for a second retrieval in free text, which
+# the harness then parses. The tool path replaces this with real tool calls.
+_LEGACY_SEARCH_RULE = """\
 If the excerpts look like they missed the point of the question and a different \
 search would plainly do better, reply with exactly one line:
 
@@ -82,6 +88,56 @@ SEARCH: <better search query>
 
 Use that only when you have not already been given a second set of excerpts.\
 """
+
+SYSTEM_PROMPT = f"{RULES}\n{_LEGACY_SEARCH_RULE}"
+
+TOOL_GUIDANCE = """\
+You find excerpts by calling search_channel. You have none until you search, so \
+search before answering, and search again if the results miss: different \
+words, a person, or a date range.
+
+Today's date is given at the top of the question. Use it to turn "last month", \
+"recently" or "since September" into since and until dates (YYYY-MM-DD). For \
+what someone has been doing, pass their name as person with a date range; the \
+query can then be "*".
+
+The excerpts your searches return are your only evidence, and every rule above \
+applies to them.\
+"""
+
+TOOL_SYSTEM_PROMPT = f"{RULES}\n\n{TOOL_GUIDANCE}"
+
+# The model chooses what, who and when. It cannot choose where: there is
+# deliberately no channel parameter, so the tool is bound to the channel the
+# question came from and D2's isolation is not something it can argue past.
+SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_channel",
+        "description": (
+            "Search this Slack channel's history. Returns dated excerpts with "
+            "permalinks. Optionally restrict to a person and/or a date range."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": 'What to look for. "*" when a person or dates '
+                    "already define what you want.",
+                },
+                "person": {
+                    "type": "string",
+                    "description": "Only conversations this person took part in "
+                    'or was named in. A first name is enough, e.g. "yuan".',
+                },
+                "since": {"type": "string", "description": "YYYY-MM-DD, inclusive."},
+                "until": {"type": "string", "description": "YYYY-MM-DD, inclusive."},
+            },
+            "required": ["query"],
+        },
+    },
+}
 
 
 class LocalOnlyUnavailable(CredentialsError):
@@ -96,6 +152,34 @@ class LocalOnlyUnavailable(CredentialsError):
 
 class Completer(Protocol):
     async def complete(self, system: str, user: str) -> str: ...
+
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: str  # JSON text, exactly as the model produced it
+
+
+@dataclass
+class ChatTurn:
+    """One assistant turn: text, or a request to run tools, or both."""
+
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+
+    def as_message(self) -> dict:
+        msg: dict = {"role": "assistant", "content": self.content or ""}
+        if self.tool_calls:
+            msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.name, "arguments": tc.arguments},
+                }
+                for tc in self.tool_calls
+            ]
+        return msg
 
 
 @dataclass(frozen=True)
@@ -217,8 +301,14 @@ def build_user_prompt(
     glossary_block: str = "",
     roster: Sequence[str] = (),
     profiles_block: str = "",
+    today: date | None = None,
 ) -> str:
     sections: list[str] = []
+
+    # Without this the model infers "now" from the newest excerpt it was
+    # shown, or worse, from its training data.
+    if today is not None:
+        sections.append(f"Today is {today.isoformat()} ({today:%A}).")
 
     if roster:
         sections.append(
@@ -298,11 +388,23 @@ class Answerer:
         skill: object | None = None,
         store: object | None = None,
         profiles: object | None = None,
+        tools: bool = True,
+        answer_budget: float = 60.0,
+        max_tool_rounds: int = 4,
+        today: Callable[[], date] | None = None,
+        now: Callable[[], float] | None = None,
     ) -> None:
         self._retriever = retriever
         self._completer = completer
         self._team_url = team_url
         self._top_k = top_k
+        # The tool loop is used whenever the completer can hold a multi-turn
+        # conversation with tools; otherwise the single-shot path below.
+        self._tools = tools and hasattr(completer, "chat")
+        self._budget = answer_budget
+        self._max_rounds = max(1, max_tool_rounds)
+        self._today = today or (lambda: datetime.now().astimezone().date())
+        self._now = now or time.monotonic
         # Duck-typed rather than imported, so the answerer stays testable
         # without a glossary and the module dependency stays one-way.
         self._glossary = glossary
@@ -357,6 +459,10 @@ class Answerer:
             )
 
         gloss = self._glossary_block(question, channel_id)
+        if self._tools:
+            return await self._answer_with_tools(
+                channel_id, question, thread, gloss, roster, expansion, deep
+            )
         query = self._search_query(question, thread, channel_id, expansion)
 
         hits = await self._retriever.retrieve(channel_id, query, self._top_k)
@@ -381,6 +487,181 @@ class Answerer:
             return _finalize(reply, hits, searches=2, deep=deep)
 
         return _finalize(reply, hits, searches=1, deep=deep)
+
+    # ------------------------------------------------------------ tool loop
+
+    async def _answer_with_tools(
+        self,
+        channel_id: str,
+        question: str,
+        thread: Sequence[Turn] | None,
+        gloss: str,
+        roster: Sequence[str],
+        expansion: str,
+        deep: bool,
+    ) -> Answer:
+        """Let the model search, as often as it needs, inside a time budget.
+
+        The harness supplies three things the model cannot know — today's date,
+        who is in the channel, and the channel itself — and executes the
+        searches it asks for. Everything else is the model's call: what to look
+        for, who, and over what window.
+
+        The first turn must search, so no answer is ever produced from nothing.
+        The budget is wall-clock: when too little remains, or the round limit is
+        reached, the model is made to answer from what it has already found.
+        """
+        start = self._now()
+        deadline = start + self._budget
+        reserve = min(15.0, self._budget / 4)  # time kept back for the answer
+
+        messages: list[dict] = [
+            {"role": "system", "content": self._tool_system()},
+            {"role": "user", "content": self._tool_prompt(
+                question, thread, gloss, roster, expansion)},
+        ]
+        seen: dict[int, Hit] = {}
+        searches = 0
+        rounds = 0
+        reply = ""
+
+        while True:
+            remaining = deadline - self._now()
+            if rounds >= self._max_rounds or remaining < reserve:
+                choice = "none"
+            elif rounds == 0:
+                choice = "required"
+            else:
+                choice = "auto"
+
+            turn = await self._completer.chat(
+                messages, tools=[SEARCH_TOOL], tool_choice=choice
+            )
+            if choice == "none" or not turn.tool_calls:
+                # Tool calls on a forced final turn are ignored, not executed:
+                # the point of forcing is that the loop ends here.
+                reply = turn.content.strip()
+                break
+
+            messages.append(turn.as_message())
+            for call in turn.tool_calls:
+                result = await self._run_tool(channel_id, call, seen)
+                messages.append(
+                    {"role": "tool", "tool_call_id": call.id, "content": result}
+                )
+                searches += 1
+            rounds += 1
+
+        hits = list(seen.values())
+        if not hits:
+            # Nothing was ever retrieved, so anything said would be ungrounded.
+            return Answer(text=_refusal_text(), refused=True, chunk_ids=[],
+                          searches=searches, deep=deep)
+        logger.info(
+            "Answered in %d search(es) over %d round(s), %.1fs",
+            searches, rounds, self._now() - start,
+        )
+        return _finalize(reply, hits, searches=searches, deep=deep)
+
+    async def _run_tool(
+        self, channel_id: str, call: ToolCall, seen: dict[int, Hit]
+    ) -> str:
+        """Execute one search and render it for the model.
+
+        Problems with the call are reported back as text rather than raised —
+        a model that wrote "last month" instead of a date can correct itself on
+        the next turn, whereas an exception would cost the whole answer.
+        """
+        if call.name != SEARCH_TOOL["function"]["name"]:
+            return f"There is no tool called {call.name!r}. Use search_channel."
+        try:
+            args = json.loads(call.arguments or "{}")
+            if not isinstance(args, dict):
+                raise ValueError
+        except ValueError:
+            return ("Could not read the search arguments as JSON. Call "
+                    "search_channel again with a JSON object.")
+
+        dates: dict[str, date | None] = {}
+        for key in ("since", "until"):
+            raw = args.get(key)
+            if raw in (None, ""):
+                dates[key] = None
+                continue
+            try:
+                dates[key] = date.fromisoformat(str(raw)[:10])
+            except ValueError:
+                return (f"Could not use {key}={raw!r}: dates must be YYYY-MM-DD. "
+                        "Work them out from today's date and search again.")
+
+        query = str(args.get("query") or "*")
+        person = (str(args["person"]).strip() or None) if args.get("person") else None
+        hits = await self._retriever.search(
+            channel_id, query, self._top_k,
+            person=person, since=dates["since"], until=dates["until"],
+        )
+        logger.info(
+            "search_channel(query=%r, person=%r, since=%s, until=%s) -> %d",
+            query, person, dates["since"], dates["until"], len(hits),
+        )
+        if not hits:
+            scope = ", ".join(
+                f"{k}={v}" for k, v in
+                (("person", person), ("since", dates["since"]), ("until", dates["until"]))
+                if v
+            )
+            return ("No excerpts matched" + (f" ({scope})" if scope else "") +
+                    ". Try other words, a wider date range, or no person filter.")
+
+        blocks = []
+        for h in hits:
+            first = h.chunk_id not in seen
+            seen.setdefault(h.chunk_id, h)
+            n = list(seen).index(h.chunk_id) + 1
+            if not first:
+                blocks.append(f"--- Excerpt {n} (already shown above)")
+                continue
+            link = permalink(self._team_url, channel_id, h.anchor_ts)
+            when = _fmt_range(h.chunk["start_ts"], h.chunk["end_ts"])
+            kind = "thread" if h.chunk["kind"] == "thread" else "conversation"
+            blocks.append(f"--- Excerpt {n} ({kind}, {when})\nPERMALINK: {link}\n{h.text}")
+        return "\n\n".join(blocks)
+
+    def _tool_system(self) -> str:
+        body = getattr(self._skill, "body", "") if self._skill is not None else ""
+        if not body:
+            return TOOL_SYSTEM_PROMPT
+        return (f"{TOOL_SYSTEM_PROMPT}\n\n--- Domain guidance for this workspace "
+                f"---\n\n{body}")
+
+    def _tool_prompt(
+        self,
+        question: str,
+        thread: Sequence[Turn] | None,
+        gloss: str,
+        roster: Sequence[str],
+        expansion: str,
+    ) -> str:
+        """The per-question context. Today's date is here, not in the system
+        prompt: it changes daily, and the system prompt is meant to be stable."""
+        today = self._today()
+        sections = [f"Today is {today.isoformat()} ({today:%A})."]
+        if roster:
+            sections.append(
+                "People in this channel: " + ", ".join(sorted(roster)) + ".\n"
+                "A name in the question refers to one of them."
+            )
+        if gloss:
+            sections.append(gloss)
+        profiles = self._profiles_block(question, [], roster)
+        if profiles:
+            sections.append(profiles)
+        if thread:
+            sections.append("Conversation so far (this thread):\n" + render_thread(thread))
+        if expansion:
+            sections.append(f"Terms that may be worth searching for: {expansion}")
+        sections.append(f"Question: {question}")
+        return "\n\n".join(sections)
 
     def _system(self) -> str:
         """Base rules plus the domain skill, re-read if it changed on disk."""
@@ -407,6 +688,7 @@ class Answerer:
             glossary_block=glossary_block,
             roster=roster,
             profiles_block=self._profiles_block(question, hits, roster),
+            today=self._today(),
         )
         return (await self._completer.complete(self._system(), user)).strip()
 
@@ -453,6 +735,18 @@ def _finalize(
     return Answer(
         text=reply, refused=False, chunk_ids=ids, searches=searches, deep=deep
     )
+
+
+def _to_chat_turn(resp) -> ChatTurn:
+    """Normalise an OpenAI-style response into a ChatTurn."""
+    if not resp.choices:
+        return ChatTurn()
+    m = resp.choices[0].message
+    calls = [
+        ToolCall(id=tc.id, name=tc.function.name, arguments=tc.function.arguments or "{}")
+        for tc in (m.tool_calls or [])
+    ]
+    return ChatTurn(content=m.content or "", tool_calls=calls)
 
 
 class LocalCompleter:
@@ -545,6 +839,32 @@ class LocalCompleter:
                     getattr(choice, "finish_reason", "?"),
                     getattr(usage, "completion_tokens", "?"),
                 )
+            if attempt < self._attempts:
+                await asyncio.sleep(1.0)
+        raise RuntimeError(f"empty completion after {self._attempts} attempts")
+
+    async def chat(self, messages, *, tools, tool_choice) -> ChatTurn:
+        """One assistant turn with tools available.
+
+        A turn with neither text nor tool calls is the same transient empty
+        that complete() retries, and is retried the same way.
+        """
+        for attempt in range(1, self._attempts + 1):
+            resp = await self._client.chat.completions.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                temperature=self._temperature,
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+            turn = _to_chat_turn(resp)
+            if turn.content.strip() or turn.tool_calls:
+                return turn
+            logger.warning(
+                "Local model returned an empty turn (attempt %d/%d, tool_choice=%s)",
+                attempt, self._attempts, tool_choice,
+            )
             if attempt < self._attempts:
                 await asyncio.sleep(1.0)
         raise RuntimeError(f"empty completion after {self._attempts} attempts")
@@ -653,6 +973,52 @@ class FallbackCompleter:
         self.answers += 1
         self.fallbacks += 1
         return await self._fallback.complete(system, user)
+
+    async def chat(self, messages, *, tools, tool_choice) -> ChatTurn:
+        """complete(), for a multi-turn conversation with tools.
+
+        Only a turn that ends the conversation counts towards answers and
+        fallbacks — counting every search round would inflate "N/M answered
+        off-site" into a number that means nothing.
+        """
+        if not self.paused:
+            try:
+                turn = await self._primary.chat(
+                    messages, tools=tools, tool_choice=tool_choice
+                )
+                if turn.content.strip() or turn.tool_calls:
+                    self._failures = 0
+                    self.last_used = "local"
+                    self.local_ok = True
+                    if not turn.tool_calls:
+                        self.answers += 1
+                    return turn
+                raise RuntimeError("empty completion")
+            except Exception as exc:
+                self._failures += 1
+                if self._failures >= self._limit:
+                    self._skip_until = time.monotonic() + self._pause
+                self.local_ok = False
+                logger.warning("Local chat failed (%s)", exc)
+                if self._fallback is None:
+                    raise LocalOnlyUnavailable(
+                        f"The local cluster could not answer ({exc}) and "
+                        "LOCAL_ONLY is set, so there is no fallback. Unset "
+                        "LOCAL_ONLY to allow OpenRouter."
+                    ) from exc
+
+        if self._fallback is None:
+            raise LocalOnlyUnavailable(
+                "The local cluster is unavailable and LOCAL_ONLY is set, so no "
+                "answer can be produced. Unset LOCAL_ONLY to fall back to "
+                "OpenRouter."
+            )
+        self.last_used = "openrouter"
+        turn = await self._fallback.chat(messages, tools=tools, tool_choice=tool_choice)
+        if not turn.tool_calls:
+            self.answers += 1
+            self.fallbacks += 1
+        return turn
 
 
 class OpenRouterCompleter:
@@ -780,3 +1146,15 @@ class OpenRouterCompleter:
             logger.warning("OpenRouter returned no choices for model=%s", self._model)
             return ""
         return resp.choices[0].message.content or ""
+
+    async def chat(self, messages, *, tools, tool_choice) -> ChatTurn:
+        self._reload_key_if_changed()
+        resp = await self._client.chat.completions.create(
+            model=self._model,
+            max_tokens=self._max_tokens,
+            temperature=self._temperature,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        return _to_chat_turn(resp)

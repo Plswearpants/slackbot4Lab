@@ -105,7 +105,8 @@ class SlackQA:
                 self.settings.local_api_base,
                 self.settings.max_answer_tokens,
                 temperature=self.settings.temperature,
-                timeout=self.settings.local_timeout,
+                timeout=min(self.settings.local_timeout,
+                            self.settings.answer_budget_seconds),
             )
             completer = FallbackCompleter(
                 local, None if self.settings.local_only else hosted
@@ -126,6 +127,9 @@ class SlackQA:
             skill=self.skill,
             store=self.store,
             profiles=Profiles(self.settings.profiles_dir),
+            tools=self.settings.tool_search,
+            answer_budget=self.settings.answer_budget_seconds,
+            max_tool_rounds=self.settings.max_tool_rounds,
         )
         if self.skill:
             logger.info("Domain skill loaded: %s", self.settings.skill_path)

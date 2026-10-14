@@ -55,6 +55,16 @@ class Settings(BaseSettings):
     # answers when the cluster is down.
     local_only: bool = False
 
+    # Let the model drive retrieval through a search tool: it chooses the
+    # query, a person and a date window, and may search more than once. Turn
+    # off for a model without tool support — the single-shot path remains.
+    tool_search: bool = True
+    # Wall-clock seconds per answer, all searches included. Generous, because
+    # the cluster is ours and a round trip costs seconds, not money.
+    answer_budget_seconds: float = 60.0
+    # Searching rounds before the model is made to answer regardless.
+    max_tool_rounds: int = 4
+
     @property
     def local_enabled(self) -> bool:
         return bool(self.local_api_base and self.local_model)

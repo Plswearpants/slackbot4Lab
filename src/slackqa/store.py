@@ -447,18 +447,91 @@ class Store:
                 out[d["id"]] = d
             return out
 
-    async def bm25_search(
-        self, channel_id: str, query: str, limit: int
-    ) -> list[tuple[int, float]]:
-        """FTS5 match, restricted to one channel. Returns (chunk_id, bm25 score)."""
+    async def users_matching(self, fragment: str) -> list[tuple[str, str]]:
+        """Users whose display name contains ``fragment`` as a word prefix.
+
+        Case-insensitive, so the model can pass "yuan" for "Yuan Xie". Word
+        prefixes rather than substrings, so "li" finds "Fujia Li" but not
+        "Julian".
+        """
+        frag = fragment.strip().lower()
+        if not frag:
+            return []
         async with self._db.execute(
-            """SELECT f.rowid AS id, bm25(chunks_fts) AS score
+            """SELECT user_id, display_name FROM users
+               WHERE lower(display_name) LIKE ? || '%'
+                  OR lower(display_name) LIKE '% ' || ? || '%'
+               ORDER BY display_name""",
+            (frag, frag),
+        ) as cur:
+            return [(r["user_id"], r["display_name"]) for r in await cur.fetchall()]
+
+    async def chunk_ids_matching(
+        self,
+        channel_id: str,
+        *,
+        since_ts: float | None = None,
+        until_ts: float | None = None,
+        user_ids: Sequence[str] = (),
+        names: Sequence[str] = (),
+    ) -> list[int]:
+        """Chunks in one channel overlapping a window, optionally for a person.
+
+        A person matches if they took part (by id) or are named in the text,
+        which is how a colleague who was discussed but never spoke is found.
+        Always scoped to ``channel_id`` — the filters narrow, never widen.
+        Returned oldest first.
+        """
+        where = ["channel_id = ?"]
+        args: list[Any] = [channel_id]
+        if since_ts is not None:
+            where.append("end_ts >= ?")
+            args.append(since_ts)
+        if until_ts is not None:
+            where.append("start_ts < ?")
+            args.append(until_ts)
+        who = []
+        for uid in user_ids:
+            who.append("participants LIKE '%' || ? || '%'")
+            args.append(f'"{uid}"')
+        for name in names:
+            who.append("text LIKE '%' || ? || '%'")
+            args.append(name)
+        if who:
+            where.append("(" + " OR ".join(who) + ")")
+        async with self._db.execute(
+            f"SELECT id FROM chunks WHERE {' AND '.join(where)} "
+            "ORDER BY start_ts ASC, id ASC",
+            args,
+        ) as cur:
+            return [r["id"] for r in await cur.fetchall()]
+
+    async def bm25_search(
+        self,
+        channel_id: str,
+        query: str,
+        limit: int,
+        *,
+        allowed: Sequence[int] | None = None,
+    ) -> list[tuple[int, float]]:
+        """FTS5 match, restricted to one channel. Returns (chunk_id, bm25 score).
+
+        ``allowed`` restricts to a precomputed id set — passed as one JSON
+        parameter, since a year's window can exceed SQLite's variable limit.
+        """
+        extra, args = "", [query, channel_id]
+        if allowed is not None:
+            extra = " AND c.id IN (SELECT value FROM json_each(?))"
+            args.append(json.dumps(list(allowed)))
+        args.append(limit)
+        async with self._db.execute(
+            f"""SELECT f.rowid AS id, bm25(chunks_fts) AS score
                FROM chunks_fts f
                JOIN chunks c ON c.id = f.rowid
-               WHERE chunks_fts MATCH ? AND c.channel_id = ?
+               WHERE chunks_fts MATCH ? AND c.channel_id = ?{extra}
                ORDER BY score ASC, f.rowid ASC
                LIMIT ?""",
-            (query, channel_id, limit),
+            args,
         ) as cur:
             return [(r["id"], r["score"]) for r in await cur.fetchall()]
 

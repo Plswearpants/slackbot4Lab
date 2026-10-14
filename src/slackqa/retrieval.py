@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -113,18 +114,31 @@ class Retriever:
         self._rrf_k = rrf_k
         self._min_cosine = min_cosine
 
-    async def _bm25_ranking(self, channel_id: str, query: str) -> list[int]:
+    async def _bm25_ranking(
+        self, channel_id: str, query: str, allowed: Sequence[int] | None = None
+    ) -> list[int]:
         expr = fts_query(query)
         if not expr:
             return []
-        hits = await self._store.bm25_search(channel_id, expr, self._candidates)
+        hits = await self._store.bm25_search(
+            channel_id, expr, self._candidates, allowed=allowed
+        )
         # bm25() returns lower-is-better; store already orders ascending.
         return [chunk_id for chunk_id, _ in hits]
 
-    async def _vector_ranking(self, channel_id: str, query: str) -> list[int]:
+    async def _vector_ranking(
+        self, channel_id: str, query: str, allowed: Sequence[int] | None = None
+    ) -> list[int]:
         ids, mat = await self._store.embeddings_for_channel(channel_id)
         if not ids or mat.size == 0:
             return []
+        if allowed is not None:
+            keep = set(allowed)
+            rows = [i for i, cid in enumerate(ids) if cid in keep]
+            if not rows:
+                return []
+            ids = [ids[i] for i in rows]
+            mat = mat[rows]
         qvec = self._embedder.embed_query(query)
         if qvec.shape[-1] != mat.shape[1]:
             # Embedding model changed since these chunks were indexed; a
@@ -135,9 +149,16 @@ class Retriever:
         order = np.argsort(-sims)[: self._candidates]
         return [ids[i] for i in order if sims[i] >= self._min_cosine]
 
-    async def retrieve(self, channel_id: str, query: str, top_k: int) -> list[Hit]:
-        bm25 = await self._bm25_ranking(channel_id, query)
-        vector = await self._vector_ranking(channel_id, query)
+    async def retrieve(
+        self,
+        channel_id: str,
+        query: str,
+        top_k: int,
+        *,
+        allowed: Sequence[int] | None = None,
+    ) -> list[Hit]:
+        bm25 = await self._bm25_ranking(channel_id, query, allowed)
+        vector = await self._vector_ranking(channel_id, query, allowed)
 
         fused = rrf_fuse([bm25, vector], k=self._rrf_k)
         if not fused:
@@ -153,3 +174,81 @@ class Retriever:
             for cid, score in ranked
             if cid in chunks
         ]
+
+    async def search(
+        self,
+        channel_id: str,
+        query: str,
+        top_k: int,
+        *,
+        person: str | None = None,
+        since: date | None = None,
+        until: date | None = None,
+    ) -> list[Hit]:
+        """Retrieval with the filters a model can ask for, scoped to one channel.
+
+        ``person`` matches a display-name fragment ("yuan" finds "Yuan Xie");
+        ``since`` and ``until`` are inclusive whole days.
+
+        When the filters already define the answer set — "everything Yuan said
+        since Sep 13" — ranking it against the query text can only lose items,
+        which is exactly how an 82-character password note outranked a real
+        experiment update. So a set that fits in ``top_k``, or a query with no
+        content of its own, comes back whole and in date order. Larger sets are
+        ranked as usual, but only within the filter.
+        """
+        filtered = person is not None or since is not None or until is not None
+        if not filtered:
+            return await self.retrieve(channel_id, query, top_k)
+
+        user_ids: list[str] = []
+        names: list[str] = []
+        if person:
+            matches = await self._store.users_matching(person)
+            if not matches:
+                # Dropping an unmatched filter would quietly answer a question
+                # about somebody else.
+                return []
+            user_ids = [uid for uid, _ in matches]
+            names = [name for _, name in matches]
+
+        since_ts = _day_start(since) if since else None
+        until_ts = _day_start(until + timedelta(days=1)) if until else None
+        allowed = await self._store.chunk_ids_matching(
+            channel_id,
+            since_ts=since_ts,
+            until_ts=until_ts,
+            user_ids=user_ids,
+            names=names,
+        )
+        if not allowed:
+            return []
+
+        content = _query_content(query, names)
+        if len(allowed) <= top_k or not content:
+            # Newest top_k when it does not all fit, presented oldest first.
+            chosen = allowed[-top_k:]
+            chunks = await self._store.chunks_by_id(chosen)
+            return [
+                Hit(chunk_id=cid, score=0.0, chunk=chunks[cid])
+                for cid in chosen
+                if cid in chunks
+            ]
+        hits = await self.retrieve(channel_id, content, top_k, allowed=allowed)
+        return sorted(hits, key=lambda h: h.chunk["start_ts"])
+
+
+def _day_start(d: date) -> float:
+    """Local midnight, matching how people in the lab mean "since Monday"."""
+    return datetime(d.year, d.month, d.day).timestamp()
+
+
+def _query_content(query: str, names: Sequence[str]) -> str:
+    """The query with wildcards and the person's own name removed.
+
+    Models searching for a person tend to repeat the name as the query, or pass
+    "*". Neither carries anything to rank on once the person filter applies.
+    """
+    words = [w for w in re.findall(r"[\w'-]+", query.lower()) if w != "*"]
+    drop = {part.lower() for n in names for part in n.split()}
+    return " ".join(w for w in words if w not in drop)
