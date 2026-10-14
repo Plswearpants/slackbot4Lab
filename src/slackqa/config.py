@@ -62,8 +62,9 @@ class Settings(BaseSettings):
     # Wall-clock seconds per answer, all searches included. Generous, because
     # the cluster is ours and a round trip costs seconds, not money.
     answer_budget_seconds: float = 60.0
-    # Searching rounds before the model is made to answer regardless.
-    max_tool_rounds: int = 4
+    # A guard against a looping model, not the budget — the budget is time.
+    # At 4 this stopped a real investigation after 5 s of a 60 s allowance.
+    max_tool_rounds: int = 12
 
     @property
     def local_enabled(self) -> bool:

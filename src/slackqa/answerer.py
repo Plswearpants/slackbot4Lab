@@ -102,10 +102,18 @@ what someone has been doing, pass their name as person with a date range; the \
 query can then be "*".
 
 The excerpts your searches return are your only evidence, and every rule above \
-applies to them.\
+applies to them. When you have enough, give the final answer. Never reply with \
+a description of searches you intend to run: run them, or answer.\
 """
 
 TOOL_SYSTEM_PROMPT = f"{RULES}\n\n{TOOL_GUIDANCE}"
+
+FINAL_TURN = """\
+Searching is over: there is no time left for more. Write your final answer \
+now from the excerpts above, with citations. If they do not support an \
+answer, reply with exactly NO_ANSWER. Do not describe searches you would \
+still like to run — this reply is posted as it stands.\
+"""
 
 # The model chooses what, who and when. It cannot choose where: there is
 # deliberately no channel parameter, so the tool is bound to the channel the
@@ -390,7 +398,7 @@ class Answerer:
         profiles: object | None = None,
         tools: bool = True,
         answer_budget: float = 60.0,
-        max_tool_rounds: int = 4,
+        max_tool_rounds: int = 12,
         today: Callable[[], date] | None = None,
         now: Callable[[], float] | None = None,
     ) -> None:
@@ -534,6 +542,12 @@ class Answerer:
             else:
                 choice = "auto"
 
+            if choice == "none":
+                # Without this the model is simply denied tools mid-
+                # investigation, and narrates what it wanted to do next —
+                # "Let me try a few more searches…" — which is then posted to
+                # Slack as if it were the answer.
+                messages.append({"role": "user", "content": FINAL_TURN})
             turn = await self._completer.chat(
                 messages, tools=[SEARCH_TOOL], tool_choice=choice
             )

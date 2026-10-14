@@ -288,3 +288,32 @@ async def test_the_legacy_path_is_told_the_date_too(omicron):
     await Answerer(omicron, legacy, team_url=TEAM,
                    today=lambda: date(2026, 10, 13)).answer(CH, "sample plates")
     assert "Today is 2026-10-13" in legacy.user
+
+
+async def test_the_forced_final_turn_says_why_tools_are_gone(omicron):
+    """Observed live: denied tools without explanation after round four, the
+    model wrote "Let me try a few more searches…", and that was posted."""
+    chat = ScriptedChat(*[search_call(query=f"q{i}") for i in range(10)])
+    await answerer(omicron, chat, max_tool_rounds=2).answer(CH, "q")
+    last = chat.calls[-1]
+    assert last["tool_choice"] == "none"
+    final_msg = last["messages"][-1]
+    assert final_msg["role"] == "user"
+    assert "final answer" in final_msg["content"].lower()
+    assert "NO_ANSWER" in final_msg["content"]
+
+
+async def test_time_not_rounds_is_the_default_limit(omicron):
+    """Four rounds took 5 s of a 60 s budget. The round guard must be well
+    clear of what a real investigation needs."""
+    import inspect
+
+    default = inspect.signature(Answerer.__init__).parameters["max_tool_rounds"].default
+    assert default >= 10
+
+
+async def test_searching_rounds_do_not_get_the_final_instruction(omicron):
+    chat = ScriptedChat(search_call(query="a"), ChatTurn(content="answer"))
+    await answerer(omicron, chat).answer(CH, "q")
+    assert not any("Searching is over" in str(m.get("content"))
+                   for m in chat.calls[1]["messages"])
