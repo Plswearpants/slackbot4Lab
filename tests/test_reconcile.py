@@ -321,3 +321,51 @@ async def test_a_live_message_keeps_paper_titles_in_its_chunk(store, embedder):
         store, embedder, CH, msg(t, f"worth a read https://doi.org/{doi}"), bot_user_id=BOT
     )
     assert "kagome superconductor" in await chunk_text(store)
+
+
+# ------------------------------------------------------- pacing and patience
+
+
+async def test_planning_pauses_between_threads_like_backfill(store, embedder, monkeypatch):
+    """Planning fetched thousands of threads back to back and was
+    rate-limited within a minute of starting."""
+    root = NOW - 50 * DAY
+    rows = []
+    for i in range(5):
+        r = root + i * DAY
+        rows += [msg(r, f"root {i}", thread=r), msg(r + 60, f"reply {i}", thread=r)]
+    slack = Slack(rows)
+    await seed(store, embedder, slack)
+
+    pauses = []
+
+    async def record(seconds):
+        pauses.append(seconds)
+
+    monkeypatch.setattr(ingest, "PAGE_PAUSE_SECONDS", 1.2)
+    monkeypatch.setattr(ingest.asyncio, "sleep", record)
+    await ingest.plan_reconcile(store, slack, CH, bot_user_id=BOT, taken_at=NOW)
+    assert pauses.count(1.2) >= 5
+
+
+async def test_rate_limits_do_not_use_up_the_retry_budget(monkeypatch):
+    """Six 429s in a row on one call used to abort an hour-long run."""
+    from slack_sdk.errors import SlackApiError
+
+    class R:
+        status_code = 429
+        headers = {"Retry-After": "1"}
+
+        def get(self, *_):
+            return None
+
+    calls = {"n": 0}
+
+    async def flaky(**kw):
+        calls["n"] += 1
+        if calls["n"] <= 9:
+            raise SlackApiError("ratelimited", R())
+        return {"ok": True}
+
+    assert await ingest._call_with_retry(flaky, attempts=6) == {"ok": True}
+    assert calls["n"] == 10

@@ -40,6 +40,8 @@ PAGE_SIZE = 1000
 # Courtesy pause between pages. Internal apps get 50+ req/min; this keeps us
 # comfortably under that without making backfill slow.
 PAGE_PAUSE_SECONDS = 1.2
+# 429s retried per call before giving up (each waits Retry-After).
+RATE_LIMIT_RETRIES = 30
 
 # Persist thread replies this often, so an interrupted backfill can resume
 # rather than restart.
@@ -73,23 +75,33 @@ async def _call_with_retry(fn, attempts: int = 6, **kwargs) -> Any:
 
     transient = (TimeoutError, aiohttp.ClientError, ConnectionError, OSError)
     backoff = 2.0
+    attempt = 0
+    rate_limited = 0
 
-    for attempt in range(attempts):
+    while attempt < attempts:
         try:
             return await fn(**kwargs)
         except SlackApiError as e:
             if e.response.status_code == 429:
+                # Slack telling us to slow down is not a failure, and must not
+                # use up the retry budget: an hour-long reconcile would die on
+                # its sixth 429 in a row. Bounded only to stop a genuinely
+                # stuck call from waiting forever.
+                rate_limited += 1
+                if rate_limited > RATE_LIMIT_RETRIES:
+                    raise
                 delay = int(e.response.headers.get("Retry-After", 5))
                 logger.warning("Rate limited; sleeping %ss", delay)
                 await asyncio.sleep(delay)
                 continue
             raise
         except transient as e:
-            if attempt == attempts - 1:
+            attempt += 1
+            if attempt == attempts:
                 raise
             logger.warning(
                 "Transient network error (%s); retry %d/%d in %.0fs",
-                type(e).__name__, attempt + 1, attempts - 1, backoff,
+                type(e).__name__, attempt, attempts - 1, backoff,
             )
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
@@ -400,6 +412,7 @@ async def reconcile_deletions(
         if ev.get("reply_count"):
             replies = await fetch_thread(client, channel_id, str(ev["ts"]))
             upstream_ts.update(str(r["ts"]) for r in replies)
+            await asyncio.sleep(PAGE_PAUSE_SECONDS)
 
     stored_ts = await store.message_ts_since(channel_id, since)
     vanished = sorted(stored_ts - upstream_ts)
@@ -469,6 +482,9 @@ async def plan_reconcile(
         if ev.get("reply_count"):
             for r in await fetch_thread(client, channel_id, str(ev["ts"])):
                 upstream.setdefault(str(r["ts"]), r)
+            # One request per thread, thousands of threads: without the same
+            # pause backfill uses, this outruns Slack's limit within a minute.
+            await asyncio.sleep(PAGE_PAUSE_SECONDS)
 
     held = {m.ts: m for m in await store.messages_in_range(channel_id, 0, taken_at)}
 
