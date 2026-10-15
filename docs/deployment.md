@@ -285,6 +285,23 @@ Then open `http://127.0.0.1:8765` locally. `/profiles` for the profile pages,
 | Is live ingestion working? | Post a plain message (no `@LAIRbot`) in an indexed channel; the dashboard's "last Slack event" should move within seconds. `@mentions` alone prove nothing — they arrive on a separate subscription. |
 | Update the code | `git pull && uv sync && systemctl --user restart slackqa` |
 | Rotate a key | Edit `.env` — the running process re-reads it, no restart needed |
+| Repair the index against Slack | `uv run slackqa reconcile` (read-only, bot can stay up), review the counts, then stop the service and `uv run slackqa reconcile --apply` |
+| Rebuild every chunk | Stop the service, `uv run slackqa reindex`, start it. Re-embeds ~10,800 chunks: about **30 minutes** on this CPU |
+
+**Run anything long on the server, detached.** A sequence like "stop the
+service, rebuild, start it" sent as one SSH command leaves the restart at the
+mercy of your laptop: if the laptop sleeps or the VPN drops, the restart never
+runs and the bot stays down. Wrap it so it finishes on the server regardless:
+
+```bash
+systemctl --user stop slackqa
+nohup sh -c "uv run slackqa reindex > logs/reindex.log 2>&1; systemctl --user start slackqa" &
+```
+
+And never `pkill -f` a pattern that also appears in your own SSH command: the
+whole remote script is one command line, so it matches itself and kills the
+session. Bracket a character that appears only in the target's command line —
+`pkill -f "bin/[s]lackqa reconcile"`.
 
 ### Backup
 
@@ -457,3 +474,21 @@ against Slack is needed to repair that.
 **Lesson:** an always-on service is the first deployment where nothing
 restarts it, so catch-up-at-startup stops quietly covering for missing live
 events. Verify ingestion with a plain message, not a question.
+
+### The reconcile exposed a chunking bug (2026-10-15)
+
+Applying the reconcile added 70 thread replies correctly, and left 14 other
+messages outside every chunk — stored, but unsearchable. `reindex_window`
+pulled a whole thread in, widened its time range to the thread's span, and
+deleted every chunk in that range while having loaded only the window's
+messages and the thread's. Everything else said in between lost its chunk.
+
+The live path had the same bug, active from the moment `message.channels` was
+subscribed: one reply today to a 2023 thread would have done this to most of a
+channel. Threads are now rebuilt whole by identity and windows by time, and
+the tests assert that incremental rebuilds equal a full rebuild. `slackqa
+reindex` repaired production.
+
+The verification that caught it — comparing orphaned and duplicated chunks
+against the pre-apply backup — is worth repeating after any bulk change. A
+count that comes out right is not evidence the chunks are right.

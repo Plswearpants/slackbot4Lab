@@ -164,8 +164,15 @@ worked. Repairing that history led to **P12**, the provenance rule.
 - `pkill -f` over SSH can match the remote shell running it, because the whole
   script is that shell's command line. Three "Touch ID failures" were this.
 
+**Reconcile, applied 10-15.** 70 thread replies added; 0 deleted, 0 edited —
+verified real, not blind spots (521 edited messages already held current
+wording). All 70 were replies, many under standup-bot roots: people's standup
+answers had been lost. Applying exposed a chunking bug — rebuilding a thread
+deleted chunks across its whole time span, orphaning other conversations —
+also live since `message.channels` was enabled. Fixed so incremental rebuilds
+equal a full one; production repaired with the new `slackqa reindex`.
+
 **Open.**
-- **Apply the reconcile** once the plan's counts have been reviewed.
 - **Credential redaction** — the `#omicron` password is still retrievable.
 - The startup line `key accepted (model=anthropic/claude-sonnet-5)` is
   misleading under `LOCAL_ONLY`.
