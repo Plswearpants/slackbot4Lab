@@ -442,8 +442,17 @@ questions to LAIRbot, excluded by design (`P1`, `is_indexable`).
 
 The two kinds of event come from separate subscriptions: `app_mention` and
 `message.channels`. A bot that answers questions proves only the first.
-`slackqa sync` recovered everything; the subscription itself is checked at
-api.slack.com → Event Subscriptions.
+`slackqa sync` recovered everything. **Cause confirmed:** `message.channels`
+had never been subscribed — only `app_mention`. Added at api.slack.com → Event
+Subscriptions → Subscribe to bot events; no reinstall was needed, since it uses
+the `channels:history` scope the bot already had. A plain test message was
+indexed and embedded within seconds of being posted.
+
+What the missing subscription cost, for the whole life of the project: edits
+were never picked up, and deletions were caught only by the 30-day reconcile
+at startup — so messages deleted when older than 30 days, and every edited
+message's original wording, may still be in the index. A full reconcile
+against Slack is needed to repair that.
 
 **Lesson:** an always-on service is the first deployment where nothing
 restarts it, so catch-up-at-startup stops quietly covering for missing live
