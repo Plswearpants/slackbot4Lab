@@ -45,6 +45,104 @@ async def _sync() -> int:
     return 0
 
 
+# Deletions beyond this share of a channel suggest a bug, not a workspace that
+# deleted a twentieth of its history — refuse rather than empty the index.
+RECONCILE_DELETE_LIMIT = 0.05
+PLAN_MAX_AGE_HOURS = 24
+
+
+async def _reconcile(args) -> int:
+    """Diff the whole index against Slack, then apply in a separate step.
+
+    Planning only reads, so it runs with the bot live and takes as long as it
+    takes. Applying writes, so it refuses while the listener is running: two
+    processes rebuilding the same chunks can leave duplicates behind.
+
+    Neither step prints message text. A deletion is often a credential someone
+    pasted by mistake, and an edit is often the same thing being fixed.
+    """
+    import json
+    import time as _time
+    import urllib.request
+
+    from slackqa import ingest
+    from slackqa.app import build
+
+    settings = get_settings()
+    plan_path = settings.data_dir / "reconcile-plan.json"
+    channels = [args.channel] if args.channel else list(settings.channels)
+
+    if args.apply:
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{settings.dashboard_port}/health", timeout=3
+            )
+            print("The listener is running. Stop it first:\n"
+                  "  systemctl --user stop slackqa\n"
+                  "then re-run, and start it again afterwards.")
+            return 1
+        except Exception:
+            pass
+        if not plan_path.exists():
+            print("No plan to apply. Run `slackqa reconcile` first.")
+            return 1
+        saved = json.loads(plan_path.read_text())
+        age_h = (_time.time() - saved["created"]) / 3600
+        if age_h > PLAN_MAX_AGE_HOURS:
+            print(f"The plan is {age_h:.0f}h old. Run `slackqa reconcile` again.")
+            return 1
+
+    bot = await build(settings)
+    try:
+        if not args.apply:
+            plans = []
+            print(f"Planning {len(channels)} channel(s). Read-only; the bot can stay up.\n")
+            for ch in channels:
+                plan = await ingest.plan_reconcile(
+                    bot.store, bot.app.client, ch, bot_user_id=bot.bot_user_id
+                )
+                held = len(await bot.store.messages_in_range(ch, 0, plan.taken_at))
+                share = len(plan.deleted) / held if held else 0.0
+                flag = "  <- over the 5% limit" if share > RECONCILE_DELETE_LIMIT else ""
+                print(f"  {ch}: {len(plan.deleted):4} deleted  {len(plan.edited):4} edited  "
+                      f"{len(plan.missing):4} missing   (of {held} held){flag}")
+                plans.append(plan)
+            plan_path.write_text(json.dumps({
+                "created": _time.time(),
+                "plans": [ingest.asdict(p) for p in plans],
+            }))
+            total = sum(p.size for p in plans)
+            print(f"\n{total} change(s) planned -> {plan_path}")
+            if total:
+                print("To apply: systemctl --user stop slackqa && "
+                      "uv run slackqa reconcile --apply && systemctl --user start slackqa")
+            return 0
+
+        plans = [ingest.ReconcilePlan(**p) for p in saved["plans"]]
+        plans = [p for p in plans if p.channel_id in channels]
+        refused = 0
+        for plan in plans:
+            held = len(await bot.store.messages_in_range(plan.channel_id, 0, plan.taken_at))
+            if held and len(plan.deleted) / held > RECONCILE_DELETE_LIMIT and not args.force:
+                print(f"  {plan.channel_id}: refusing — {len(plan.deleted)} of {held} "
+                      "messages would go. Check the plan, or pass --force.")
+                refused += 1
+                continue
+            names = await bot.names.for_channel(plan.channel_id)
+            counts = await ingest.apply_plan(
+                bot.store, bot.app.client, bot.embedder, plan,
+                bot_user_id=bot.bot_user_id, names=names,
+                gap_seconds=settings.chunk_gap_seconds,
+            )
+            print(f"  {plan.channel_id}: {counts['deleted']} deleted, "
+                  f"{counts['edited']} edited, {counts['added']} added")
+        if not refused:
+            plan_path.unlink()  # applied plans must not be re-applied later
+        return 1 if refused else 0
+    finally:
+        await bot.store.close()
+
+
 async def _ask(channel_id: str, question: str, deep: bool = False) -> int:
     """Answer one question from the terminal — no Slack round trip."""
     from slackqa.app import build
@@ -390,6 +488,15 @@ def main() -> None:
 
     sub.add_parser("run", help="sync, then listen for questions (default)")
     sub.add_parser("sync", help="backfill / catch up / reconcile, then exit")
+    rc = sub.add_parser(
+        "reconcile",
+        help="bring the whole index in line with Slack: plan first, then --apply",
+    )
+    rc.add_argument("--apply", action="store_true",
+                    help="apply the saved plan (stop the listener first)")
+    rc.add_argument("--channel", help="one channel id (default: all indexed channels)")
+    rc.add_argument("--force", action="store_true",
+                    help="apply even where a channel would lose more than 5%% of its messages")
     sub.add_parser("stats", help="show what is indexed")
     sub.add_parser("status", help="listener / index / API key indicators")
     sub.add_parser("eval", help="retrieval recall against evals/retrieval.yaml")
@@ -468,6 +575,8 @@ def _dispatch(command: str, args, parser) -> int:
         code = asyncio.run(_run())
     elif command == "sync":
         code = asyncio.run(_sync())
+    elif command == "reconcile":
+        code = asyncio.run(_reconcile(args))
     elif command == "stats":
         code = asyncio.run(_stats())
     elif command == "status":

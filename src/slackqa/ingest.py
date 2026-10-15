@@ -17,9 +17,12 @@ for, an accidentally pasted credential.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from slackqa.chunker import DEFAULT_GAP_SECONDS, affected_window, build_chunks
@@ -114,6 +117,13 @@ async def reindex_window(
     reach into it. Rebuilding a narrower range than the chunks being replaced
     would silently drop the parts that fell outside.
     """
+    if papers is None:
+        # Every rebuild must carry the resolved paper metadata, or a single
+        # live message in #coolpapers strips the titles and abstracts from its
+        # window — invisible while live events never arrived, and immediate
+        # once they did.
+        papers = await store.resolved_papers(channel_id)
+
     span = await store.chunk_span_overlapping(channel_id, lo, hi)
     if span:
         lo, hi = min(lo, span[0]), max(hi, span[1])
@@ -140,6 +150,38 @@ async def reindex_window(
     vecs = embedder.embed_documents([c.text for c in chunks])
     await store.insert_chunks(chunks, embeddings=[v.tolist() for v in vecs])
     return len(chunks)
+
+
+async def reindex_affected(
+    store: Store,
+    embedder: Embedder,
+    channel_id: str,
+    ts_values: Iterable[float],
+    *,
+    names: Mapping[str, str] | None = None,
+    gap_seconds: int = DEFAULT_GAP_SECONDS,
+) -> int:
+    """Rebuild the chunks around every changed message, merging overlaps.
+
+    Rebuilding only around the earliest and latest change — as the startup
+    reconcile once did — leaves any deleted text in between still sitting in
+    its chunk: gone from the message table, yet searchable and quotable.
+    """
+    windows = sorted(affected_window(float(t), gap_seconds) for t in ts_values)
+    merged: list[list[float]] = []
+    for lo, hi in windows:
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    papers = await store.resolved_papers(channel_id)
+    total = 0
+    for lo, hi in merged:
+        total += await reindex_window(
+            store, embedder, channel_id, lo, hi,
+            names=names, gap_seconds=gap_seconds, papers=papers,
+        )
+    return total
 
 
 async def reindex_channel(
@@ -366,27 +408,167 @@ async def reconcile_deletions(
 
     logger.info("Purging %d deleted messages from channel=%s", len(vanished), channel_id)
     await store.delete_messages(channel_id, vanished)
-
-    lo = min(float(t) for t in vanished)
-    hi = max(float(t) for t in vanished)
-    await reindex_window(
-        store,
-        embedder,
-        channel_id,
-        *affected_window(lo, gap_seconds),
-        names=names,
-        gap_seconds=gap_seconds,
+    await reindex_affected(
+        store, embedder, channel_id, [float(t) for t in vanished],
+        names=names, gap_seconds=gap_seconds,
     )
-    if hi != lo:
-        await reindex_window(
-            store,
-            embedder,
-            channel_id,
-            *affected_window(hi, gap_seconds),
-            names=names,
-            gap_seconds=gap_seconds,
-        )
     return len(vanished)
+
+
+# ------------------------------------------------------------ full reconcile
+#
+# The index should mirror Slack as it reads today, because everything in it must
+# be something a citation can point back to: an edited message is indexed as
+# edited, and a deleted one leaves the index however old it is.
+#
+# Two phases, because reading every thread takes about an hour at Slack's pace
+# and the bot should not be down for that. Planning runs with the bot live and
+# only reads. Applying runs with it stopped, and re-checks every planned change
+# against Slack right before writing it, so nothing that changed in between is
+# reverted or wrongly removed.
+
+
+@dataclass
+class ReconcilePlan:
+    channel_id: str
+    taken_at: float
+    deleted: list[str] = field(default_factory=list)       # ts held, gone upstream
+    edited: dict[str, str] = field(default_factory=dict)   # ts -> current text
+    missing: list[dict] = field(default_factory=list)      # upstream, never held
+
+    def save(self, path: Path | str) -> None:
+        Path(path).write_text(json.dumps(asdict(self)))
+
+    @classmethod
+    def load(cls, path: Path | str) -> ReconcilePlan:
+        return cls(**json.loads(Path(path).read_text()))
+
+    @property
+    def size(self) -> int:
+        return len(self.deleted) + len(self.edited) + len(self.missing)
+
+
+async def plan_reconcile(
+    store: Store,
+    client,
+    channel_id: str,
+    *,
+    bot_user_id: str | None = None,
+    taken_at: float | None = None,
+) -> ReconcilePlan:
+    """Diff everything we hold against Slack's whole history. Read-only.
+
+    Only messages older than ``taken_at`` are compared. Planning takes long
+    enough that the live bot will index new messages meanwhile, and those are
+    absent from the snapshot — without the cutoff they would look deleted.
+    """
+    taken_at = time.time() if taken_at is None else taken_at
+    upstream: dict[str, dict] = {}
+    for ev in await fetch_history(client, channel_id):
+        upstream[str(ev["ts"])] = ev
+        if ev.get("reply_count"):
+            for r in await fetch_thread(client, channel_id, str(ev["ts"])):
+                upstream.setdefault(str(r["ts"]), r)
+
+    held = {m.ts: m for m in await store.messages_in_range(channel_id, 0, taken_at)}
+
+    plan = ReconcilePlan(channel_id=channel_id, taken_at=taken_at)
+    for ts, m in held.items():
+        ev = upstream.get(ts)
+        if ev is None or not is_indexable(ev, bot_user_id):
+            plan.deleted.append(ts)
+        elif str(ev.get("text") or "") != m.text:
+            plan.edited[ts] = str(ev.get("text") or "")
+    for ts, ev in upstream.items():
+        if ts not in held and float(ts) <= taken_at and is_indexable(ev, bot_user_id):
+            plan.missing.append(ev)
+    plan.deleted.sort(key=float)
+    logger.info(
+        "Reconcile plan for %s: %d deleted, %d edited, %d missing",
+        channel_id, len(plan.deleted), len(plan.edited), len(plan.missing),
+    )
+    return plan
+
+
+async def fetch_one(
+    client, channel_id: str, ts: str, thread_ts: str | None = None
+) -> dict | None:
+    """One message as Slack holds it now, or None if it no longer exists."""
+    try:
+        if thread_ts and thread_ts != ts:
+            resp = await _call_with_retry(
+                client.conversations_replies, channel=channel_id, ts=thread_ts,
+                oldest=ts, latest=ts, inclusive=True, limit=1,
+            )
+        else:
+            resp = await _call_with_retry(
+                client.conversations_history, channel=channel_id,
+                oldest=ts, latest=ts, inclusive=True, limit=1,
+            )
+    except Exception as exc:
+        # The whole thread was deleted, taking its replies with it.
+        if "thread_not_found" in str(exc):
+            return None
+        raise
+    for m in resp.get("messages") or []:
+        if str(m.get("ts")) == ts:
+            return m
+    return None
+
+
+async def apply_plan(
+    store: Store,
+    client,
+    embedder: Embedder,
+    plan: ReconcilePlan,
+    *,
+    bot_user_id: str | None = None,
+    names: Mapping[str, str] | None = None,
+    gap_seconds: int = DEFAULT_GAP_SECONDS,
+) -> dict[str, int]:
+    """Make the planned changes, deciding each from Slack as it is now."""
+    ch = plan.channel_id
+    held = {m.ts: m for m in await store.messages_in_range(ch, 0, float("inf"))}
+    counts = {"deleted": 0, "edited": 0, "added": 0}
+    touched: list[float] = []
+
+    async def settle(ts: str, thread_ts: str | None) -> None:
+        current = await fetch_one(client, ch, ts, thread_ts)
+        await asyncio.sleep(PAGE_PAUSE_SECONDS)
+        mine = held.get(ts)
+        if current is None or not is_indexable(current, bot_user_id):
+            if mine is not None:
+                await store.delete_message(ch, ts)
+                counts["deleted"] += 1
+                touched.append(float(ts))
+            return
+        text = str(current.get("text") or "")
+        if mine is None:
+            await store.upsert_messages([_to_message(ch, current)])
+            counts["added"] += 1
+            touched.append(float(ts))
+        elif text != mine.text:
+            await store.upsert_messages([_to_message(ch, current)])
+            counts["edited"] += 1
+            touched.append(float(ts))
+
+    for ts in plan.deleted:
+        if ts in held:
+            await settle(ts, held[ts].thread_ts)
+    for ts in plan.edited:
+        if ts in held:
+            await settle(ts, held[ts].thread_ts)
+    for ev in plan.missing:
+        ts = str(ev["ts"])
+        if ts not in held:
+            await settle(ts, str(ev["thread_ts"]) if ev.get("thread_ts") else None)
+
+    if touched:
+        await reindex_affected(
+            store, embedder, ch, touched, names=names, gap_seconds=gap_seconds
+        )
+    logger.info("Reconciled %s: %s", ch, counts)
+    return counts
 
 
 # ----------------------------------------------------------------- live events
