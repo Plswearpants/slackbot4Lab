@@ -167,7 +167,7 @@ into one by default is not.
 ## 6. Phase 4 — Verify before going live
 
 Run these in order. **Do not start the listener yet** — the laptop is still
-serving, and two listeners answer every question twice.
+serving, and two listeners split Slack's events between them (§7).
 
 ```bash
 uv run slackqa status        # index reads back: 6 channels, ~22.7k messages
@@ -200,10 +200,12 @@ What to check in the `ask` output:
 
 ## 7. Phase 5 — Cut over
 
-**Stop the laptop listener first.** Socket Mode permits multiple connections:
-both processes would receive every mention, reply twice, and write to two
-databases that immediately diverge. Nothing prevents this — it is discipline,
-not a lock.
+**Stop the laptop listener first.** Socket Mode allows an app several open
+connections, and Slack delivers each event to **one** of them. Two listeners
+therefore do not reply twice — they split the traffic. Each silently misses
+part of the questions and part of the messages, and their databases drift
+apart with nothing in Slack to show it. Nothing prevents this; it is
+discipline, not a lock.
 
 ```bash
 # On the laptop
@@ -280,6 +282,7 @@ Then open `http://127.0.0.1:8765` locally. `/profiles` for the profile pages,
 | Restart | `systemctl --user restart slackqa` |
 | Status without a browser | `uv run slackqa status` |
 | Catch up after downtime | `uv run slackqa sync` (a restart also catches up) |
+| Is live ingestion working? | Post a plain message (no `@LAIRbot`) in an indexed channel; the dashboard's "last Slack event" should move within seconds. `@mentions` alone prove nothing — they arrive on a separate subscription. |
 | Update the code | `git pull && uv sync && systemctl --user restart slackqa` |
 | Rotate a key | Edit `.env` — the running process re-reads it, no restart needed |
 
@@ -427,3 +430,21 @@ Three of the four were invisible from Slack. Answers kept arriving, cited and
 plausible, while the local backend was entirely bypassed. A working bot is not
 evidence of a working configuration — check the backend the dashboard reports,
 not whether replies appear.
+
+### Plain messages stopped arriving (found 2026-10-15)
+
+Two days after cutover, five channels held messages the index did not. The
+socket was healthy, Slack's five-hourly session rotations were clean, and
+`@LAIRbot` questions were answered normally — but no plain channel message had
+reached the handler since the restart. Six genuine misses, including Jisun's
+tip crash in `#tesla`; the other eight unindexed messages were bot posts and
+questions to LAIRbot, excluded by design (`P1`, `is_indexable`).
+
+The two kinds of event come from separate subscriptions: `app_mention` and
+`message.channels`. A bot that answers questions proves only the first.
+`slackqa sync` recovered everything; the subscription itself is checked at
+api.slack.com → Event Subscriptions.
+
+**Lesson:** an always-on service is the first deployment where nothing
+restarts it, so catch-up-at-startup stops quietly covering for missing live
+events. Verify ingestion with a plain message, not a question.
