@@ -45,6 +45,47 @@ async def _sync() -> int:
     return 0
 
 
+def _listener_running(settings) -> bool:
+    import urllib.request
+
+    try:
+        urllib.request.urlopen(
+            f"http://127.0.0.1:{settings.dashboard_port}/health", timeout=3
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _reindex(args) -> int:
+    """Rebuild every chunk from the stored messages.
+
+    The repair for anything that left chunks out of step with messages: no
+    message is fetched or changed, only re-chunked and re-embedded. A full
+    rebuild is by definition what incremental rebuilds should match.
+    """
+    from slackqa import ingest
+    from slackqa.app import build
+
+    settings = get_settings()
+    if _listener_running(settings):
+        print("The listener is running. Stop it first:\n  systemctl --user stop slackqa")
+        return 1
+    channels = [args.channel] if args.channel else list(settings.channels)
+    bot = await build(settings)
+    try:
+        for ch in channels:
+            names = await bot.names.for_channel(ch)
+            n = await ingest.reindex_channel(
+                bot.store, bot.embedder, ch,
+                names=names, gap_seconds=settings.chunk_gap_seconds,
+            )
+            print(f"  {ch}: {n} chunks")
+    finally:
+        await bot.store.close()
+    return 0
+
+
 # Deletions beyond this share of a channel suggest a bug, not a workspace that
 # deleted a twentieth of its history — refuse rather than empty the index.
 RECONCILE_DELETE_LIMIT = 0.05
@@ -63,7 +104,6 @@ async def _reconcile(args) -> int:
     """
     import json
     import time as _time
-    import urllib.request
 
     from slackqa import ingest
     from slackqa.app import build
@@ -73,16 +113,11 @@ async def _reconcile(args) -> int:
     channels = [args.channel] if args.channel else list(settings.channels)
 
     if args.apply:
-        try:
-            urllib.request.urlopen(
-                f"http://127.0.0.1:{settings.dashboard_port}/health", timeout=3
-            )
+        if _listener_running(settings):
             print("The listener is running. Stop it first:\n"
                   "  systemctl --user stop slackqa\n"
                   "then re-run, and start it again afterwards.")
             return 1
-        except Exception:
-            pass
         if not plan_path.exists():
             print("No plan to apply. Run `slackqa reconcile` first.")
             return 1
@@ -497,6 +532,10 @@ def main() -> None:
     rc.add_argument("--channel", help="one channel id (default: all indexed channels)")
     rc.add_argument("--force", action="store_true",
                     help="apply even where a channel would lose more than 5%% of its messages")
+    ri = sub.add_parser(
+        "reindex", help="rebuild every chunk from stored messages (stop the listener first)"
+    )
+    ri.add_argument("--channel", help="one channel id (default: all indexed channels)")
     sub.add_parser("stats", help="show what is indexed")
     sub.add_parser("status", help="listener / index / API key indicators")
     sub.add_parser("eval", help="retrieval recall against evals/retrieval.yaml")
@@ -577,6 +616,8 @@ def _dispatch(command: str, args, parser) -> int:
         code = asyncio.run(_sync())
     elif command == "reconcile":
         code = asyncio.run(_reconcile(args))
+    elif command == "reindex":
+        code = asyncio.run(_reindex(args))
     elif command == "stats":
         code = asyncio.run(_stats())
     elif command == "status":

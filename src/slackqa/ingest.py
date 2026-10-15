@@ -122,12 +122,20 @@ async def reindex_window(
     gap_seconds: int = DEFAULT_GAP_SECONDS,
     papers: Mapping[str, str] | None = None,
 ) -> int:
-    """Rebuild chunks and embeddings covering ``[lo, hi]``.
+    """Rebuild the chunks affected by a change near ``[lo, hi]``.
 
-    The range is widened twice before anything is deleted: once to the full span
-    of the chunks that overlap it, and once more to cover whole threads that
-    reach into it. Rebuilding a narrower range than the chunks being replaced
-    would silently drop the parts that fell outside.
+    Threads and windows are different kinds of chunk and are rebuilt
+    differently. A window is a run of unthreaded messages close in time, so it
+    is rebuilt by time: widened to the window chunks overlapping the range, all
+    of whose messages are then reloaded. A thread is one chunk however long it
+    lasts, so it is rebuilt whole and by identity.
+
+    Mixing the two was a bug. Pulling a thread in widened the time range to the
+    thread's whole life, and then every chunk in that range was deleted while
+    only the window's messages and the thread's had been loaded. A reply today
+    to a thread from 2023 would have stripped everything said in between of its
+    chunk. The invariant now: an incremental rebuild produces exactly what a
+    full rebuild would.
     """
     if papers is None:
         # Every rebuild must carry the resolved paper metadata, or a single
@@ -136,25 +144,31 @@ async def reindex_window(
         # once they did.
         papers = await store.resolved_papers(channel_id)
 
-    span = await store.chunk_span_overlapping(channel_id, lo, hi)
+    # Windows: widen only to the window chunks that overlap, so every message
+    # those chunks were built from is reloaded before they are deleted.
+    span = await store.chunk_span_overlapping(channel_id, lo, hi, kind="window")
     if span:
         lo, hi = min(lo, span[0]), max(hi, span[1])
+    loose = [m for m in await store.messages_in_range(channel_id, lo, hi) if not m.thread_ts]
 
-    messages = await store.messages_in_range(channel_id, lo, hi)
+    # Threads: any with a message in the range, or whose chunk overlaps it —
+    # a deleted reply leaves no message behind to point at its thread.
+    roots = set(await store.thread_ts_touching(channel_id, lo, hi))
+    roots |= set(await store.thread_anchors_overlapping(channel_id, lo, hi))
+    threaded = []
+    for root in sorted(roots, key=float):
+        # A root stored before it had replies has no thread_ts and lives in a
+        # window chunk; build_chunks keeps it there, and so must this.
+        threaded += [
+            m for m in await store.messages_in_thread(channel_id, root) if m.thread_ts
+        ]
 
-    # Pull in the remainder of any thread that reaches into the window.
-    seen = {m.ts for m in messages}
-    for root in await store.thread_ts_touching(channel_id, lo, hi):
-        for m in await store.messages_in_thread(channel_id, root):
-            if m.ts not in seen:
-                messages.append(m)
-                seen.add(m.ts)
-                lo, hi = min(lo, m.ts_num), max(hi, m.ts_num)
-
-    await store.delete_chunks_in_range(channel_id, lo, hi)
+    await store.delete_chunks_in_range(channel_id, lo, hi, kind="window")
+    for root in roots:
+        await store.delete_thread_chunks(channel_id, root)
 
     chunks = build_chunks(
-        messages, gap_seconds=gap_seconds, names=names, papers=papers
+        loose + threaded, gap_seconds=gap_seconds, names=names, papers=papers
     )
     if not chunks:
         return 0

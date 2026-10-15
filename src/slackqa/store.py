@@ -362,15 +362,48 @@ class Store:
     # ------------------------------------------------------------------ chunks
 
     async def delete_chunks_in_range(
-        self, channel_id: str, start_ts: float, end_ts: float
+        self, channel_id: str, start_ts: float, end_ts: float, *, kind: str | None = None
     ) -> None:
-        """Drop chunks overlapping the range, keeping the FTS table in step."""
+        """Drop chunks overlapping the range, keeping the FTS table in step.
+
+        Pass ``kind="window"`` when rebuilding by time. A thread chunk spans its
+        thread's whole life, so deleting threads by time range removes them
+        without their messages having been reloaded.
+        """
+        sql = "SELECT id FROM chunks WHERE channel_id = ? AND end_ts >= ? AND start_ts <= ?"
+        args: list[Any] = [channel_id, start_ts, end_ts]
+        if kind is not None:
+            sql += " AND kind = ?"
+            args.append(kind)
+        async with self._db.execute(sql, args) as cur:
+            ids = [r["id"] for r in await cur.fetchall()]
+        await self._delete_chunk_ids(ids)
+
+    async def delete_thread_chunks(self, channel_id: str, thread_ts: str) -> None:
+        """Drop a thread's chunk by identity — every copy, if a bug left two."""
         async with self._db.execute(
-            """SELECT id FROM chunks
-               WHERE channel_id = ? AND end_ts >= ? AND start_ts <= ?""",
-            (channel_id, start_ts, end_ts),
+            "SELECT id FROM chunks WHERE channel_id = ? AND kind = 'thread' AND anchor_ts = ?",
+            (channel_id, thread_ts),
         ) as cur:
             ids = [r["id"] for r in await cur.fetchall()]
+        await self._delete_chunk_ids(ids)
+
+    async def thread_anchors_overlapping(
+        self, channel_id: str, start_ts: float, end_ts: float
+    ) -> list[str]:
+        """Roots of thread chunks overlapping the range.
+
+        How a thread is found after its only nearby reply was deleted: there is
+        no message left to point to it, but its chunk still holds the text.
+        """
+        async with self._db.execute(
+            """SELECT DISTINCT anchor_ts FROM chunks WHERE channel_id = ? AND kind = 'thread'
+               AND end_ts >= ? AND start_ts <= ?""",
+            (channel_id, start_ts, end_ts),
+        ) as cur:
+            return [r["anchor_ts"] for r in await cur.fetchall()]
+
+    async def _delete_chunk_ids(self, ids: Sequence[int]) -> None:
         if not ids:
             return
         await self._db.executemany(
@@ -380,7 +413,7 @@ class Store:
         await self._db.commit()
 
     async def chunk_span_overlapping(
-        self, channel_id: str, start_ts: float, end_ts: float
+        self, channel_id: str, start_ts: float, end_ts: float, *, kind: str | None = None
     ) -> tuple[float, float] | None:
         """Full time span of chunks overlapping the range, or None.
 
@@ -388,11 +421,13 @@ class Store:
         chunks were built from — a window chunk that straddles ``start_ts``
         would otherwise be regenerated from only its tail.
         """
-        async with self._db.execute(
-            """SELECT MIN(start_ts) AS lo, MAX(end_ts) AS hi FROM chunks
-               WHERE channel_id = ? AND end_ts >= ? AND start_ts <= ?""",
-            (channel_id, start_ts, end_ts),
-        ) as cur:
+        sql = ("SELECT MIN(start_ts) AS lo, MAX(end_ts) AS hi FROM chunks "
+               "WHERE channel_id = ? AND end_ts >= ? AND start_ts <= ?")
+        args: list[Any] = [channel_id, start_ts, end_ts]
+        if kind is not None:
+            sql += " AND kind = ?"
+            args.append(kind)
+        async with self._db.execute(sql, args) as cur:
             row = await cur.fetchone()
         if not row or row["lo"] is None:
             return None
