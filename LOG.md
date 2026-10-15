@@ -120,6 +120,56 @@ once thought otherwise is part of the record.
 
 ## Sessions
 
+### 2026-10-13 – 10-15 — The bot searches for itself; ingestion turns out never to have worked
+
+**Abstract.** With the bot always-on, two problems surfaced that restarts had
+been hiding. Retrieval had no sense of time, so "what is Yuan doing this month"
+missed his main update; the fix was to let the model drive its own searches
+(**D19**). And the bot had never been subscribed to plain channel messages —
+only to @mentions — so live indexing, edits and most deletions had never
+worked. Repairing that history led to **P12**, the provenance rule.
+
+**Details.**
+- `LOCAL_ONLY=true` is now on. An unreachable cluster at startup first killed
+  the service into a restart loop; it now stays up, says so loudly, and
+  refuses questions with a truthful Slack reply.
+- A transient empty completion from the cluster cost a real answer under
+  `LOCAL_ONLY`, so local calls now retry once.
+- **D19**: one `search_channel(query, person, since, until)` tool, no channel
+  parameter, first turn must search, 60 s wall-clock budget. Probing showed
+  both cluster models extract the person and turn "last month" into exact
+  dates — but only if told today's date; without it one model invented 2025.
+  A round cap of 4 then cut a real investigation short at 5 s, and the model's
+  narration ("Let me try a few more searches…") was posted as the answer. The
+  cap is now a runaway guard (12) and the forced final turn says why.
+- `message.channels` had never been subscribed. Found because an always-on
+  service is the first deployment nothing restarts. Your own "Test thread for
+  LAIRbot-remote" was the proof it wasn't arriving. Fixed in the Slack app
+  config; verified with a plain message.
+- **P12** and the full reconcile: plan with the bot live (read-only, ~1 h),
+  apply with it stopped, re-checking each change against Slack at the moment
+  of writing. Two bugs fixed on the way: the 30-day reconcile left deleted
+  text in chunks between its first and last deletion, and live rebuilds
+  stripped #coolpapers' paper titles. Planning was then rate-limited within a
+  minute — it lacked backfill's pause between threads — and 429s were
+  consuming the retry budget.
+- **D2** profile exception recorded as deliberate.
+- The planner's completion is emailed from the server through UBC's relay.
+  The first attempt vanished: its sender was the machine's own address. Sent
+  from the user's address, it arrived.
+
+**Lessons worth keeping.**
+- A working question path proves nothing about ingestion. `app_mention` and
+  `message.channels` are separate subscriptions.
+- `pkill -f` over SSH can match the remote shell running it, because the whole
+  script is that shell's command line. Three "Touch ID failures" were this.
+
+**Open.**
+- **Apply the reconcile** once the plan's counts have been reviewed.
+- **Credential redaction** — the `#omicron` password is still retrievable.
+- The startup line `key accepted (model=anthropic/claude-sonnet-5)` is
+  misleading under `LOCAL_ONLY`.
+
 ### 2026-09-01 – 10-13 — Profiles reach the model; the bot leaves the laptop
 
 **Abstract.** Two arcs. First, the profile system stopped being a read-only
