@@ -57,6 +57,7 @@ once thought otherwise is part of the record.
 | **P2** | Only channels the bot has been explicitly invited to. Being in the workspace grants nothing. | 08-06 | Invitation is the lab's consent, expressed in the tool they already use. |
 | **P3** | Deletions are real deletions — row removed from messages, chunks, and the FTS index. | 08-06 | If someone deletes a message, no artefact of it should remain quotable. Supersedes **D6**. |
 | **P12** | **Provenance:** the index mirrors Slack as it reads today. An edited message is indexed in its edited form; a message deleted in Slack leaves the index however old it is. | 10-15 | Everything indexed must be something a citation can point back to — a permalink should open on exactly what the bot quoted. `message.channels` had never been subscribed, so edits were never picked up and deletions older than the 30-day startup reconcile were never seen; `slackqa reconcile` repairs the whole history in two phases (plan live, apply with the listener stopped). |
+| **P13** | Credentials shared in a channel are ordinary channel content. The bot may surface them in answers within that channel; this is not treated as leakage. | 10-15 | Posting a shared lab password in a channel is normal practice here. Answers stay in the channel they were asked in (**D2**), so the bot repeats nothing to anyone who couldn't already read it. Depends on `LOCAL_ONLY` staying on — with the fallback enabled, an answer's excerpts would go to an outside service. |
 | **P4** | The repository stays **private**. | 08-06 | `SPEC.md` and `README.md` name the workspace URL, channel IDs, and lab specifics. |
 | **P5** | Secrets live in `.env`, never committed. The API key is re-read at use, so rotating it needs no restart. | 08-06 | Reduces the temptation to hard-code a key "just to test". |
 | **P6** | **No automated fetching through institutional subscriptions.** Metadata always; PDFs only where legally open (arXiv, Unpaywall); otherwise a link and a `needs-pdf` flag for a person to fetch with the Zotero Connector. | 08-12 | Publishers enforce systematic downloading against the institution's whole IP range. The cost of being caught falls on everyone at UBC, not on this bot. |
@@ -74,9 +75,8 @@ once thought otherwise is part of the record.
 - **Off-machine backups — monthly, by hand.** Nightly backups run on the
   institute machine and a restore is verified. The off-machine copy is a
   monthly `rsync` run in person, since the Secure Enclave key needs Touch ID.
-- **Redact credentials from the index.** A password posted in `#omicron` is
-  retrievable and was quoted back verbatim in answers. Rotate it; then scrub
-  high-confidence credential shapes at ingest and from existing chunks.
+- ~~**Redact credentials from the index.**~~ Decided against (**P13**): a
+  password posted in a channel is ordinary channel content.
 - **Retire the laptop copy** — but only after the service survives a reboot
   unaided and the off-machine copy exists. It is 99 messages stale, so rolling
   back now costs a `slackqa sync`.
@@ -173,7 +173,7 @@ also live since `message.channels` was enabled. Fixed so incremental rebuilds
 equal a full one; production repaired with the new `slackqa reindex`.
 
 **Open.**
-- **Credential redaction** — the `#omicron` password is still retrievable.
+- ~~**Credential redaction**~~ — decided against, see **P13**.
 - The startup line `key accepted (model=anthropic/claude-sonnet-5)` is
   misleading under `LOCAL_ONLY`.
 
