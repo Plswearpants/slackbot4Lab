@@ -31,8 +31,8 @@ particularly `P4`/`P5` on secrets, `P7` on the unauthenticated dashboard, and
                           └───┬────────────────────────────┬───────┘
                               │ https (no VPN)             │ https
                               ▼                            ▼
-                   qmi-ai-assistant.phas.ubc.ca    openrouter.ai
-                   GLM 5.2 — answers               fallback only
+                   qmi-ai-alpha.phas.ubc.ca:24764  openrouter.ai
+                   GLM-5.3 via SGLang — answers    fallback only
 ```
 
 | Aspect | End state |
@@ -137,8 +137,8 @@ Edit `.env` on the institute machine. What changes from the laptop:
 ```bash
 DATA_DIR=/local/path/slackqa-data     # §2 q1 — local disk, not NFS
 
-LOCAL_API_BASE=https://qmi-ai-assistant.phas.ubc.ca/api
-LOCAL_MODEL=glm-5.2-nvfp4
+LOCAL_API_BASE=https://qmi-ai-alpha.phas.ubc.ca:24764/v1
+LOCAL_MODEL=sglang-8001/GLM-5.3-NVFP4
 LOCAL_ONLY=false                      # see the decision below
 
 DASHBOARD_HOST=127.0.0.1              # leave as-is; see §7
@@ -492,3 +492,20 @@ reindex` repaired production.
 The verification that caught it — comparing orphaned and duplicated chunks
 against the pre-apply backup — is worth repeating after any bulk change. A
 count that comes out right is not evidence the chunks are right.
+
+### Moved to the SGLang endpoint (2026-10-20)
+
+The cluster now also serves SGLang directly at
+`https://qmi-ai-alpha.phas.ubc.ca:24764/v1`, with its own key. Model ids carry
+a port prefix: `sglang-8001/GLM-5.3-NVFP4` and `sglang-8002/DeepSeek-V4.1-Flash`,
+plus role aliases `sglang-8001/thinker` and `sglang-8002/agent` that currently
+point at the same two models. All four passed the checks that matter before
+switching — reachable from this host, and forced tool calls followed by a
+forced final answer (**D19** depends on both, and under `LOCAL_ONLY` a model
+without tool support would refuse every question). Switched like-for-like to
+`sglang-8001/GLM-5.3-NVFP4`; the previous `.env` is kept as `.env.bak-*`.
+
+The aliases are worth considering: if the admin repoints `thinker` when models
+are upgraded, the bot follows without a config change — the rename that once
+sent every answer off-site would not recur. The cost is that a swap would be
+silent; check the dashboard's backend line after any cluster change either way.
