@@ -31,7 +31,7 @@ particularly `P4`/`P5` on secrets, `P7` on the unauthenticated dashboard, and
                           └───┬────────────────────────────┬───────┘
                               │ https (no VPN)             │ https
                               ▼                            ▼
-                   qmi-ai-alpha.phas.ubc.ca:24764  openrouter.ai
+                   qmi-ai-api.phas.ubc.ca:24274    openrouter.ai
                    GLM-5.3 via SGLang — answers    fallback only
 ```
 
@@ -137,7 +137,7 @@ Edit `.env` on the institute machine. What changes from the laptop:
 ```bash
 DATA_DIR=/local/path/slackqa-data     # §2 q1 — local disk, not NFS
 
-LOCAL_API_BASE=https://qmi-ai-alpha.phas.ubc.ca:24764/v1
+LOCAL_API_BASE=https://qmi-ai-api.phas.ubc.ca:24274/v1
 LOCAL_MODEL=sglang-8001/GLM-5.3-NVFP4
 LOCAL_ONLY=false                      # see the decision below
 
@@ -509,3 +509,13 @@ The aliases are worth considering: if the admin repoints `thinker` when models
 are upgraded, the bot follows without a config change — the rename that once
 sent every answer off-site would not recur. The cost is that a swap would be
 silent; check the dashboard's backend line after any cluster change either way.
+
+### Moved to qmi-ai-api (2026-11-09)
+
+The admin issued a new endpoint and key: `https://qmi-ai-api.phas.ubc.ca:24274/v1`.
+It serves the same two models under their full ids
+(`sglang-8001/GLM-5.3-NVFP4`, `sglang-8002/DeepSeek-V4.1-Flash`) and four
+unprefixed role aliases: `thinker` and `smart` (GLM-5.3, reasoning), `agent`
+and `fast` (DeepSeek, no reasoning). All six passed reachability and the
+tool-call checks from this host. Switched like-for-like — base URL and key
+only, model unchanged. Previous `.env` kept as `.env.bak-20261109-1005`.
